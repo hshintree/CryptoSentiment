@@ -1,146 +1,143 @@
-## trainer.py
-
+# trainer.py  — hot-fix: ensure numeric hyper-parameters are cast to float/int
+import yaml
 import torch
 import numpy as np
-import yaml
+import pandas as pd
+from typing import Any, Dict
+
+from transformers import get_linear_schedule_with_warmup
+try:
+    from transformers.optimization import AdamW          # HF ≥4.40
+except ImportError:
+    from torch.optim import AdamW                        # fallback
+
+from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import GroupKFold
 from sklearn.utils import shuffle
-from torch.utils.data import DataLoader, Dataset
-from transformers import AdamW, get_linear_schedule_with_warmup
-from typing import Any, Dict
-from model import Model  # Assuming Model class from model.py
-from market_labeler import MarketLabeler  # For accessing labeled data
+
+from model            import Model
+from market_labeler   import MarketLabeler
+
 
 class Trainer:
-    """Trainer class for handling the training process of BERT-based models."""
+    """Handle training of the BERT-based model with grouped CV."""
 
-    def __init__(self, model: Model, data: pd.DataFrame, config_path: str = 'config.yaml'):
-        """
-        Initialize the Trainer with a model, a labeled dataset, and configurations.
+    def __init__(self,
+                 model: Model,
+                 data: pd.DataFrame,
+                 config_path: str = "config.yaml") -> None:
 
-        Args:
-            model (Model): Instance of the model to be trained.
-            data (pd.DataFrame): Labeled dataset using market behaviors.
-            config_path (str): Path to the configuration YAML file.
-        """
-        # Load configuration
-        with open(config_path, 'r') as file:
-            self.config = yaml.safe_load(file)
-        
-        # Recording model and data
+        with open(config_path, "r") as f:
+            self.config = yaml.safe_load(f)
+
         self.model = model
-        self.data = data
+        self.data  = data
 
-        # Extract training configurations
-        training_config = self.config['training']
-        self.learning_rate = training_config.get('learning_rate', 1e-5)
-        self.batch_size = training_config.get('batch_size', 12)
-        self.epochs = training_config.get('epochs', 2)
-        self.optimizer = AdamW(self.model.bert_model.parameters(), lr=self.learning_rate)
-        self.warmup_steps = self.config['training'].get('warmup_steps', 0.1)
+        tcfg = self.config["training"]
+        # ---- cast YAML scalars safely -----------------------------------
+        self.learning_rate = float(tcfg.get("learning_rate", 1e-5))
+        self.batch_size    = int  (tcfg.get("batch_size",    12))
+        self.epochs        = int  (tcfg.get("epochs",        2))
+        self.warmup_frac   = float(tcfg.get("warmup_steps",  0.1))
+        # -----------------------------------------------------------------
+
+        self.optimizer = AdamW(self.model.bert_model.parameters(),
+                               lr=self.learning_rate)
         self.scheduler = None
 
+    # ------------------------------------------------------------------  
+    # Public API  
+    # ------------------------------------------------------------------
     def train(self) -> None:
-        """Execute training over the defined number of epochs."""
+        """5-fold grouped CV + standard training loop."""
         data = self._prepare_data(self.data)
-        gkf = GroupKFold(n_splits=5)  # Use Group 5-fold cross-validation
 
-        for fold, (train_idx, val_idx) in enumerate(gkf.split(data, groups=data['group'])):
-            print(f"Fold {fold + 1}/{gkf.n_splits}")
+        gkf = GroupKFold(n_splits=5)
+        for fold, (tr_idx, va_idx) in enumerate(gkf.split(data,
+                                                         groups=data["group"])):
+            print(f"\n── Fold {fold+1}/{gkf.n_splits} ──")
+            tr_df, va_df = data.iloc[tr_idx], data.iloc[va_idx]
 
-            train_data = data.iloc[train_idx]
-            val_data = data.iloc[val_idx]
+            tr_loader = self._make_loader(tr_df, shuffle=True)
+            va_loader = self._make_loader(va_df, shuffle=False)
 
-            # Prepare PyTorch datasets
-            train_loader = self._create_torch_loader(train_data, shuffle=True)
-            val_loader = self._create_torch_loader(val_data)
-
-            total_steps = len(train_loader) * self.epochs
+            tot_steps  = len(tr_loader) * self.epochs
             self.scheduler = get_linear_schedule_with_warmup(
                 self.optimizer,
-                num_warmup_steps=int(total_steps * self.warmup_steps),
-                num_training_steps=total_steps,
+                num_warmup_steps=int(tot_steps * self.warmup_frac),
+                num_training_steps=tot_steps,
             )
 
             self.model.freeze_layers(11)
             self.model.bert_model.train()
 
             for epoch in range(self.epochs):
-                print(f"Epoch {epoch + 1}/{self.epochs}")
+                print(f"  Epoch {epoch+1}/{self.epochs}")
+                self._train_one_epoch(tr_loader)
+                self._evaluate(va_loader)
 
-                # Training Loop
-                for step, batch in enumerate(train_loader):
-                    labels = batch.pop('labels')
-                    outputs = self.model.bert_model(**batch)
-                    loss = torch.nn.functional.cross_entropy(outputs.logits, labels)
-                    loss.backward()
-                    self.optimizer.step()
-                    self.scheduler.step()
-                    self.optimizer.zero_grad()
+    # ------------------------------------------------------------------  
+    # Helpers  
+    # ------------------------------------------------------------------
+    def _prepare_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add TBL labels, Previous-Label feature and CV groups."""
+        lbl = MarketLabeler().label_data(df)
+        lbl["Previous Label"] = lbl["Label"].shift(1).fillna("Neutral")
+        lbl["group"]          = self._assign_groups(lbl)
+        return lbl
 
-                    if step % 10 == 0:
-                        print(f"Step {step}, Loss: {loss.item()}")
+    @staticmethod
+    def _assign_groups(df: pd.DataFrame) -> np.ndarray:
+        """Random 20 % time buckets so tweets close in time stay together."""
+        return shuffle(df.index.to_numpy()) // max(len(df) // 5, 1)
 
-                # Validation
-                self._evaluate(val_loader)
-
-    def _prepare_data(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Prepare data for training including label labeling."""
-        labeler = MarketLabeler()
-        labeled_data = labeler.label_data(data)
-        labeled_data['group'] = self._assign_groups(labeled_data)
-        return labeled_data
-
-    def _assign_groups(self, data: pd.DataFrame) -> np.ndarray:
-        """Assign groups for cross-validation to prevent leakage."""
-        return shuffle(data.index.to_numpy()) // (len(data) // 5)
-
-    def _create_torch_loader(self, data: pd.DataFrame, shuffle: bool = False) -> DataLoader:
-        """Convert DataFrame into a PyTorch DataLoader."""
-        encodings = []
-        labels = []
-        for _, row in data.iterrows():
+    def _make_loader(self, df: pd.DataFrame, *, shuffle: bool) -> DataLoader:
+        encodings, labels = [], []
+        for _, row in df.iterrows():
             enc = self.model.preprocess_input(
-                tweet_content=row['Tweet Content'],
-                rsi=row['RSI'],
-                roc=row['ROC'],
-                date=row['Tweet Date'],
-                previous_label=row['Previous Label'],
+                tweet_content = row["Tweet Content"],
+                rsi           = row["RSI"],
+                roc           = row["ROC"],
+                date          = row["Tweet Date"].strftime("%Y-%m-%d"),
+                previous_label= row["Previous Label"],
             )
-            enc = {k: v.squeeze(0) for k, v in enc.items()}
-            encodings.append(enc)
-            label = 0 if row['Label'] == 'Bearish' else (1 if row['Label'] == 'Neutral' else 2)
-            labels.append(label)
+            encodings.append({k: v.squeeze(0) for k, v in enc.items()})
+            labels.append(0 if row["Label"] == "Bearish"
+                          else 1 if row["Label"] == "Neutral" else 2)
 
-        class DS(Dataset):
+        class _DS(Dataset):
             def __init__(self, enc, lab):
-                self.enc = enc
-                self.lab = lab
-
-            def __len__(self):
-                return len(self.lab)
-
-            def __getitem__(self, idx):
-                item = {k: v for k, v in self.enc[idx].items()}
-                item['labels'] = torch.tensor(self.lab[idx])
+                self.enc, self.lab = enc, lab
+            def __len__(self):  return len(self.lab)
+            def __getitem__(self, i):
+                item = {k: v for k, v in self.enc[i].items()}
+                item["labels"] = torch.tensor(self.lab[i])
                 return item
 
-        dataset = DS(encodings, labels)
-        return DataLoader(dataset, batch_size=self.batch_size, shuffle=shuffle)
+        return DataLoader(_DS(encodings, labels),
+                          batch_size=self.batch_size,
+                          shuffle=shuffle)
+
+    def _train_one_epoch(self, loader: DataLoader) -> None:
+        for step, batch in enumerate(loader):
+            lbls  = batch.pop("labels")
+            outs  = self.model.bert_model(**batch)
+            loss  = torch.nn.functional.cross_entropy(outs.logits, lbls)
+            loss.backward()
+            self.optimizer.step();  self.scheduler.step()
+            self.optimizer.zero_grad()
+            if step % 10 == 0:
+                print(f"    step {step:<4}  loss {loss.item():.4f}")
 
     def _evaluate(self, loader: DataLoader) -> None:
-        """Evaluate the model on validation dataset."""
         self.model.bert_model.eval()
-        correct = 0
-        total = 0
+        correct = total = 0
         with torch.no_grad():
             for batch in loader:
-                labels = batch.pop('labels')
-                outputs = self.model.bert_model(**batch)
-                preds = outputs.logits.argmax(dim=-1)
-                correct += (preds == labels).sum().item()
-                total += labels.size(0)
-        accuracy = correct / total if total else 0
-        print(f"Validation Accuracy: {accuracy:.4f}")
+                lbls = batch.pop("labels")
+                preds = self.model.bert_model(**batch).logits.argmax(dim=-1)
+                correct += (preds == lbls).sum().item()
+                total   += lbls.size(0)
+        acc = correct / total if total else 0
+        print(f"  → val acc: {acc:.4f}")
         self.model.bert_model.train()
-

@@ -14,9 +14,13 @@ class Model:
         Args:
             params (dict): Contains configurations such as model type and prompt tuning settings.
         """
+        if isinstance(params, str): # let users pass a path
+            import yaml, pathlib
+            with open(pathlib.Path(params)) as f:
+                params = yaml.safe_load(f)["model"]
         # Load configuration file for model settings
         with open('config.yaml', 'r') as file:
-            config = yaml.safe_load(file)
+            config = yaml.safe_load(file)["model"]
 
         # Retrieve settings from configuration
         self.model_type = params.get('type', 'CryptoBERT')
