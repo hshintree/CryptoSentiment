@@ -15,7 +15,7 @@ class Model:
             params (dict): Contains configurations such as model type and prompt tuning settings.
         """
         if isinstance(params, str): # let users pass a path
-            import yaml, pathlib
+            import pathlib
             with open(pathlib.Path(params)) as f:
                 params = yaml.safe_load(f)["model"]
         # Load configuration file for model settings
@@ -53,12 +53,18 @@ class Model:
             dict: Encoded inputs suitable for model.
         """
         # Create a prompt with market-related context
-        prompt = f"Date: {date}, Previous Label: {previous_label}, ROC: {roc}, RSI: {rsi}, Tweet: {tweet_content}"
-        
-        # Encode the text with tokenizer
-        inputs = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
-        
-        return inputs
+        prompt = (
+            f"Date:{date} | Prev:{previous_label} | ROC:{roc:.4f} | "
+            f"RSI:{rsi:.2f} | Tweet:{tweet_content}"
+        )
+        input = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            padding=False,                # let DataCollator pad per‑batch
+            truncation=True,
+            max_length=300,               # ≤ 514 for BERT‑based models
+        )
+        return input
 
     def forward(self, inputs):
         """

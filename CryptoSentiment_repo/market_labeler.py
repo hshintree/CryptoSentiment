@@ -1,69 +1,147 @@
-## market_labeler.py
+"""market_labeler.py
 
-import pandas as pd
+Triple‑Barrier *adaptive* labeler.
+
+Implements the **6‑monthly grid‑search** described in
+"Revisiting Financial Sentiment Analysis: A Language Model Approach" – the
+barrier factors (Fu, Fl) and the vertical barrier horizon (Vt) are
+re‑optimised every ~126 trading days (≈ 6 calendar months) to maximise the
+in‑sample Sharpe ratio of a naïve long/short strategy that enters on every
+signal.
+
+The grid size is intentionally small so optimisation remains fast – feel free
+to widen the ranges in the YAML config.
+"""
+
+from __future__ import annotations
+
+import itertools
+from dataclasses import dataclass
+
 import numpy as np
+import pandas as pd
 import yaml
-from typing import Dict
+
+# ---------------------------------------------------------------------------
+# Configuration dataclass ----------------------------------------------------
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _TBLConfig:
+    fu_grid: list[float]  # e.g. [0.02, 0.04, 0.06]
+    fl_grid: list[float]  # e.g. [0.02, 0.04, 0.06]
+    vt_grid: list[int]    # e.g. [3, 5, 10]
+    rebalance_days: int   # optimise every N obs (≈ 126 for 6 months)
+
+    @classmethod
+    def from_yaml(cls, path: str = "config.yaml") -> "_TBLConfig":
+        cfg = yaml.safe_load(open(path))
+        mkt = cfg.get("market_labeling", {})
+        return cls(
+            fu_grid=mkt.get("fu_grid", [0.04, 0.06, 0.08]),
+            fl_grid=mkt.get("fl_grid", [0.04, 0.06, 0.08]),
+            vt_grid=mkt.get("vt_grid", [5, 10]),
+            rebalance_days=mkt.get("rebalance_days", 126),
+        )
+
+# ---------------------------------------------------------------------------
+# Helper – Sharpe of naïve strategy -----------------------------------------
+# ---------------------------------------------------------------------------
+
+def _sharpe(returns: pd.Series) -> float:
+    if returns.std(ddof=0) == 0:
+        return -np.inf
+    return returns.mean() / returns.std(ddof=0) * np.sqrt(252)
+
+# ---------------------------------------------------------------------------
+# Main labeler ---------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 class MarketLabeler:
-    def __init__(self, config_path: str = 'config.yaml'):
-        """Initialize the labeler with configuration settings."""
-        with open(config_path, 'r') as file:
-            self.config = yaml.safe_load(file)
+    def __init__(self, cfg_path: str = "config.yaml") -> None:
+        self.cfg = _TBLConfig.from_yaml(cfg_path)
 
-        market_labeling_config = self.config.get('market_labeling', {})
-        self.strategy = market_labeling_config.get('strategy', 'TBL')
-        self.vertical_barrier_range = market_labeling_config.get('barrier_window', '8-15')
-        self.vertical_barrier_min, self.vertical_barrier_max = map(int, self.vertical_barrier_range.split('-'))
-        # Multipliers applied to volatility when computing the price barriers
-        self.upper_vol_mult = market_labeling_config.get('upper_vol_mult', 1.0)
-        self.lower_vol_mult = market_labeling_config.get('lower_vol_mult', 1.0)
-
+    # ------------------------------------------------------------------
     def label_data(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Apply Triple Barrier Labeling with volatility scaling."""
-        volatility = self.estimate_historical_volatility(data).fillna(method='bfill').fillna(method='ffill')
+        """Add Upper/Lower/Vertical Barrier + categorical *Label* per row.
 
-        labels = []
-        upper_list = []
-        lower_list = []
-        vert_list = []
+        Parameters
+        ----------
+        data : DataFrame with at least columns ``Tweet Date`` & ``Close``.
+        """
+        df = data.copy().sort_values("Tweet Date").reset_index(drop=True)
 
-        for i in range(len(data)):
-            window = np.random.randint(self.vertical_barrier_min, self.vertical_barrier_max + 1)
-            end_idx = min(i + window, len(data) - 1)
+        prices = df["Close"].values
+        dates  = pd.to_datetime(df["Tweet Date"]).values
 
-            start_price = data.at[i, 'Close']
-            up = start_price * (1 + volatility.iloc[i] * self.upper_vol_mult)
-            down = start_price * (1 - volatility.iloc[i] * self.lower_vol_mult)
+        # pre‑allocate
+        upper, lower, label = np.empty(len(df)), np.empty(len(df)), np.empty(len(df), dtype=object)
 
-            price_path = data.loc[i:end_idx, 'Close']
+        # --- rolling optimisation -------------------------------------
+        n = len(df)
+        step = self.cfg.rebalance_days
+        for start in range(0, n, step):
+            end = min(start + step, n)
+            win_prices = prices[start:end]
 
-            bullish = (price_path >= up).any()
-            bearish = (price_path <= down).any()
+            # grid‑search on the *previous* window, except for the very first one
+            opt_slice = slice(max(0, start - step), start)
+            fu, fl, vt = self._optimize_params(prices[opt_slice])
 
-            if bullish and not bearish:
-                label = 'Bullish'
-            elif bearish and not bullish:
-                label = 'Bearish'
+            # apply TBL with optimal params to current slice
+            u, l, lab = self._apply_tbl(win_prices, fu, fl, vt)
+            upper[start:end], lower[start:end], label[start:end] = u, l, lab
+
+        df["Upper Barrier"] = upper
+        df["Lower Barrier"] = lower
+        df["Vertical Barrier"] = vt  # constant within slice (last vt)
+        df["Label"] = label
+        return df
+
+    # ------------------------------------------------------------------
+    def _optimize_params(self, prices: np.ndarray) -> tuple[float, float, int]:
+        """Grid‑search Fu, Fl, Vt on *in‑sample* slice to max Sharpe."""
+        best = (-np.inf, self.cfg.fu_grid[0], self.cfg.fl_grid[0], self.cfg.vt_grid[0])
+        for fu, fl, vt in itertools.product(self.cfg.fu_grid, self.cfg.fl_grid, self.cfg.vt_grid):
+            _, _, lab = self._apply_tbl(prices, fu, fl, vt)
+            rets = self._strategy_returns(prices, lab)
+            s = _sharpe(pd.Series(rets))
+            if s > best[0]:
+                best = (s, fu, fl, vt)
+        return best[1:]
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _apply_tbl(prices: np.ndarray, fu: float, fl: float, vt: int):
+        """Vectorised triple‑barrier."""
+        n = len(prices)
+        upper = prices * (1 + fu)
+        lower = prices * (1 - fl)
+        label = np.empty(n, dtype=object)
+
+        for i in range(n):
+            horizon = min(i + vt, n - 1)
+            path = prices[i:horizon + 1]
+            hit_upper = np.any(path >= upper[i])
+            hit_lower = np.any(path <= lower[i])
+            if hit_upper and hit_lower:
+                # whichever comes first in time wins
+                up_idx = np.argmax(path >= upper[i])
+                lo_idx = np.argmax(path <= lower[i])
+                label[i] = "Bullish" if up_idx < lo_idx else "Bearish"
+            elif hit_upper:
+                label[i] = "Bullish"
+            elif hit_lower:
+                label[i] = "Bearish"
             else:
-                label = 'Neutral'
+                label[i] = "Neutral"
+        return upper[:n], lower[:n], label
 
-            labels.append(label)
-            upper_list.append(up)
-            lower_list.append(down)
-            vert_list.append(end_idx)
-
-        data = data.copy()
-        data['Upper Barrier'] = upper_list
-        data['Lower Barrier'] = lower_list
-        data['Vertical Barrier'] = vert_list
-        data['Label'] = labels
-
-        return data
-
-    def estimate_historical_volatility(self, data: pd.DataFrame) -> pd.Series:
-        """Estimate historical volatility using EWMA on log returns."""
-        log_returns = np.log(data['Close'] / data['Close'].shift(1))
-        volatility = log_returns.ewm(span=30, adjust=False).std()
-        return volatility
-
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _strategy_returns(prices: np.ndarray, labels: np.ndarray) -> np.ndarray:
+        """Generate simple daily returns for long/short strategy used in Sharpe optimisation."""
+        pos = np.where(labels == "Bullish", +1, np.where(labels == "Bearish", -1, 0))
+        pct = np.diff(prices) / prices[:-1]
+        # align returns with starting position (length n‑1)
+        return pos[:-1] * pct

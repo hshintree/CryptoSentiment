@@ -4,8 +4,10 @@ import torch
 import numpy as np
 import pandas as pd
 from typing import Any, Dict
+from tqdm import tqdm
 
 from transformers import get_linear_schedule_with_warmup
+from transformers import DataCollatorWithPadding
 try:
     from transformers.optimization import AdamW          # HF ≥4.40
 except ImportError:
@@ -32,6 +34,7 @@ class Trainer:
 
         self.model = model
         self.data  = data
+        self.fold_states = []
 
         tcfg = self.config["training"]
         # ---- cast YAML scalars safely -----------------------------------
@@ -72,9 +75,17 @@ class Trainer:
             self.model.bert_model.train()
 
             for epoch in range(self.epochs):
+                loop = tqdm(tr_loader, desc=f"fold {fold+1} epoch {epoch+1}/{self.epochs}",
+                leave=False)
                 print(f"  Epoch {epoch+1}/{self.epochs}")
-                self._train_one_epoch(tr_loader)
+                self._train_one_epoch(loop)
                 self._evaluate(va_loader)
+                # keep a lightweight reference for later voting
+                self.fold_states.append({"model": self.model})
+        if hasattr(self, "fold_states"):
+            pred_df = cross_val_predict(self, data)
+            pred_df.to_csv("signals_per_tweet.csv", index=False)
+            print(f"✅ wrote {len(pred_df):,} rows → signals_per_tweet.csv")
 
     # ------------------------------------------------------------------  
     # Helpers  
@@ -101,6 +112,7 @@ class Trainer:
                 date          = row["Tweet Date"].strftime("%Y-%m-%d"),
                 previous_label= row["Previous Label"],
             )
+            #maybe need to hand *lists* or 1-D tensors to DataCollator so it can pad/truncate, no squeeze
             encodings.append({k: v.squeeze(0) for k, v in enc.items()})
             labels.append(0 if row["Label"] == "Bearish"
                           else 1 if row["Label"] == "Neutral" else 2)
@@ -113,10 +125,12 @@ class Trainer:
                 item = {k: v for k, v in self.enc[i].items()}
                 item["labels"] = torch.tensor(self.lab[i])
                 return item
-
+        # Pad sequences in each mini-batch so tensor lengths match
+        collator = DataCollatorWithPadding(tokenizer=self.model.tokenizer)
         return DataLoader(_DS(encodings, labels),
                           batch_size=self.batch_size,
-                          shuffle=shuffle)
+                          shuffle=shuffle,
+                          collate_fn=collator)
 
     def _train_one_epoch(self, loader: DataLoader) -> None:
         for step, batch in enumerate(loader):
@@ -141,3 +155,41 @@ class Trainer:
         acc = correct / total if total else 0
         print(f"  → val acc: {acc:.4f}")
         self.model.bert_model.train()
+
+def cross_val_predict(trainer: "Trainer",
+                      data: pd.DataFrame,
+                      cfg_path: str = "config.yaml") -> pd.DataFrame:
+    """
+    Run the already-trained 5 fold models on *all* data and return
+    majority-vote label + confidence (mean softmax prob of winning class).
+    """
+    from collections import defaultdict
+    votes   = defaultdict(list)   # idx → [class_ids]
+    confs   = defaultdict(list)   # idx → [prob_of_pred]
+
+    for fold_id, fold_state in enumerate(trainer.fold_states):
+        model = fold_state["model"]            # reuse fine-tuned weights
+        loader = trainer._make_loader(data, shuffle=False)
+
+        model.bert_model.eval()
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(loader):
+                idx   = batch_idx              # 1-to-1 because no shuffle
+                logits = model.bert_model(**{k: v for k, v in batch.items()
+                                             if k != "labels"}).logits
+                probs  = torch.softmax(logits, dim=-1)
+                pred   = probs.argmax(dim=-1).item()
+                votes[idx].append(pred)
+                confs[idx].append(probs[0, pred].item())
+
+    # majority + avg-confidence
+    maj_lbl = {i: max(set(votes[i]), key=votes[i].count) for i in votes}
+    maj_cnf = {i: np.mean(confs[i]) for i in confs}
+
+    out = data.copy()
+    out["Pred_Label"]   = out.index.map(maj_lbl)
+    out["Pred_Conf"]    = out.index.map(maj_cnf)
+    out["Pred_Label"]   = out["Pred_Label"].map({0: "Bearish",
+                                                 1: "Neutral",
+                                                 2: "Bullish"})
+    return out
