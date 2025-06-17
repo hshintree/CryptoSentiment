@@ -17,8 +17,8 @@ data:
     remove_user_ids: true
     remove_punctuation: true
     lemmatization: true
-  prebit_dataset_path: "path/to/prebit.csv"  # Combined dataset from Kaggle
-  prebit_dataset_dir: "path/to/prebit_dir"  # Directory with yearly CSVs
+  prebit_dataset_path: null  # Combined dataset from Kaggle
+  prebit_dataset_dir: "/Users/hakeemshindy/Downloads/prebit_dir"  # Directory with yearly CSVs
 model:
   type: "CryptoBERT"  # Options: CryptoBERT, FinBERT
   prompt_tuning: true

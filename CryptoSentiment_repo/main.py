@@ -5,7 +5,7 @@ import os
 import yaml
 import pandas as pd
 
-from dataset_loader import DatasetLoader
+from CryptoSentiment_repo.dataset_old_loader import DatasetLoader
 from preprocessor import Preprocessor
 from market_labeler import MarketLabeler
 from model import Model
