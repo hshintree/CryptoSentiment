@@ -24,7 +24,7 @@ Outputs (preprocessed files and signals) are saved to the location specified in 
 
 Key Components
 
-DatasetLoader – Reads CSV files from the paths in the config, checking that required columns exist. It can load the split PreBit dataset from a directory or a single combined CSV.
+DatasetLoader – Reads PreBit CSVs using paths from the config. It supports the directory layout with yearly tweet files and price labels or a single combined CSV, and can aggregate tweets per day.
 
 Preprocessor – Applies basic NLP cleaning steps (lowercasing, stripping URLs/usernames, removing punctuation, optional lemmatization) and computes technical indicators (RSI, ROC) if price columns exist. Missing values are forward/backward filled, and indicators are min–max normalized. 
 
@@ -53,6 +53,14 @@ VectorBT Backtesting – The backtester uses stubbed market regimes and dummy pr
 Expand Evaluation and Experimentation – The model currently outputs BERT hidden states without a classification head. Adding a small neural head or fine-tuning the BERT weights will likely be required for real predictive power. Also consider adding experiments, hyperparameter tuning, and cross-validation for the signal generation thresholds.
 
 Project Organization – Tests and a comprehensive README are missing. Adding unit tests for each module and extending the documentation would make the codebase easier to maintain.
+
+## Setup
+Use Python 3.10 in a new conda environment:
+```bash
+conda create -n cryptosentiment python=3.10
+conda activate cryptosentiment
+pip install -r requirements.txt
+```
 
 By following these pointers—configuring real data, installing the necessary libraries, and gradually refining each stage—you can evolve the current skeleton into a fully functional crypto‑sentiment trading pipeline.
 
