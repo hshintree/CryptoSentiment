@@ -17,6 +17,7 @@ data:
     - remove_user_ids: true
     - remove_punctuation: true
     - lemmatization: true
+  prebit_dataset_path: "path/to/prebit.csv"  # Combined dataset from Kaggle
 model:
   type: "CryptoBERT"  # Options: CryptoBERT, FinBERT
   prompt_tuning: true

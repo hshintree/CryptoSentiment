@@ -12,7 +12,7 @@ Run preprocessing (text cleanup plus optional technical indicators).
 
 Apply market labeling.
 
-Initialize a BERT-based model and train it.
+Initialize a BERT-based model and train it using PyTorch.
 
 Evaluate the trained model.
 
@@ -30,9 +30,9 @@ Preprocessor – Applies basic NLP cleaning steps (lowercasing, stripping URLs/u
 
 MarketLabeler – Implements the “Triple Barrier Labeling” approach. It estimates volatility from log returns and sets dynamic price barriers, then assigns a label (“Bullish”, “Bearish”, “Neutral”) based on which barrier gets hit first within a fixed time window. 
 
-Model – Wraps either CryptoBERT or FinBERT via HuggingFace. preprocess_input embeds market context (date, previous label, RSI, ROC) directly into a text prompt before tokenization. The forward pass simply runs the BERT model and returns the hidden states. 
+Model – Wraps either CryptoBERT or FinBERT via HuggingFace. `preprocess_input` embeds market context (date, previous label, RSI, ROC) directly into a text prompt before tokenization.
 
-Trainer – Performs group 5‑fold cross‑validation using TensorFlow and calculates loss via SparseCategoricalCrossentropy. Training batches are produced from the labeled DataFrame. 
+Trainer – Performs group 5‑fold cross‑validation using PyTorch. The first 11 layers of CryptoBERT are frozen and only the classification head is updated. Training uses the AdamW optimizer with a warmup schedule.
 
 Evaluation – Computes accuracy, precision, recall and F1 using scikit‑learn after generating predictions with the model. 
 
@@ -42,9 +42,9 @@ Backtester – Uses vectorbt to simulate trading strategies on different predefi
 
 Pointers for Next Steps
 
-Data Acquisition & Paths – The config file currently contains placeholder paths (e.g., path/to/bitcoin_historical_events.csv). Gathering real data, placing it in those paths, and adjusting the config accordingly is a prerequisite for running the pipeline.
+Data Acquisition & Paths – The configuration now supports the PreBit multimodal dataset. Set `prebit_dataset_path` in `config.yaml` to the downloaded CSV from Kaggle. If this path is provided the separate tweet and event files are ignored.
 
-Deep Learning Environment – The project uses TensorFlow and HuggingFace models; setting up an environment with the required versions of these libraries is necessary. The repository has no dependency list yet, so creating a requirements.txt or similar would help.
+Deep Learning Environment – The pipeline has migrated to PyTorch. Install PyTorch and the HuggingFace transformers library. A `requirements.txt` file is recommended.
 
 Understanding Triple Barrier Labeling – The MarketLabeler provides only a basic implementation. Learning the underlying triple-barrier method from the referenced paper will help refine the labeling strategy and tune parameters such as barrier distances or volatility estimation.
 

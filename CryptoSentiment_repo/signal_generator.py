@@ -71,7 +71,7 @@ class SignalGenerator:
                 previous_label=row['Previous Label']
             )
             logits = self.model.forward(inputs)
-            predicted_label = np.argmax(logits, axis=-1).numpy()[0]
+            predicted_label = logits.argmax(dim=-1).item()
             predictions.append(predicted_label)
         return np.array(predictions)
 

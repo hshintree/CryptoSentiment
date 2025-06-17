@@ -10,17 +10,31 @@ class DatasetLoader:
         with open(config_path, 'r') as file:
             self.config = yaml.safe_load(file)
         
-        # Extract paths from configuration
-        self.bitcoin_events_path = self.config['data'].get('bitcoin_events_path', 'path/to/bitcoin_historical_events.csv')
-        self.tweets_data_path = self.config['data'].get('tweets_data_path', 'path/to/tweet_data.csv')
-        self.output_data_path = self.config['data'].get('output_data_path', 'path/to/output')
+        # Extract paths from configuration. The repository can either use the
+        # original split between events and tweets or the combined PreBit
+        # dataset.  ``prebit_dataset_path`` takes precedence if provided.
+        self.prebit_dataset_path = self.config['data'].get('prebit_dataset_path')
+        self.bitcoin_events_path = self.config['data'].get(
+            'bitcoin_events_path', 'path/to/bitcoin_historical_events.csv')
+        self.tweets_data_path = self.config['data'].get(
+            'tweets_data_path', 'path/to/tweet_data.csv')
+        self.output_data_path = self.config['data'].get(
+            'output_data_path', 'path/to/output')
 
-        # Validate paths
-        if not os.path.exists(self.bitcoin_events_path):
-            raise FileNotFoundError(f"Bitcoin events file not found at path: {self.bitcoin_events_path}")
-            
-        if not os.path.exists(self.tweets_data_path):
-            raise FileNotFoundError(f"Tweets data file not found at path: {self.tweets_data_path}")
+        # Validate paths. If a PreBit dataset path is provided, use that and
+        # skip the individual event/tweet checks.
+        if self.prebit_dataset_path:
+            if not os.path.exists(self.prebit_dataset_path):
+                raise FileNotFoundError(
+                    f"PreBit dataset file not found at path: {self.prebit_dataset_path}")
+        else:
+            if not os.path.exists(self.bitcoin_events_path):
+                raise FileNotFoundError(
+                    f"Bitcoin events file not found at path: {self.bitcoin_events_path}")
+
+            if not os.path.exists(self.tweets_data_path):
+                raise FileNotFoundError(
+                    f"Tweets data file not found at path: {self.tweets_data_path}")
 
     def load_event_data(self) -> pd.DataFrame:
         """Load Bitcoin historical events data"""
@@ -49,3 +63,23 @@ class DatasetLoader:
             return tweet_data
         except Exception as e:
             raise RuntimeError(f"Failed to load Tweets data: {e}")
+
+    def load_prebit_data(self) -> pd.DataFrame:
+        """Load the PreBit multimodal dataset if configured."""
+        if not self.prebit_dataset_path:
+            raise RuntimeError("PreBit dataset path not provided in config")
+        try:
+            data = pd.read_csv(self.prebit_dataset_path, parse_dates=['date'])
+            required = {'date', 'tweet', 'close'}
+            if not required.issubset(set(data.columns)):
+                raise ValueError(
+                    "PreBit dataset must contain columns: 'date', 'tweet', 'close'")
+            # Align column names with rest of pipeline
+            data = data.rename(columns={
+                'date': 'Tweet Date',
+                'tweet': 'Tweet Content',
+                'close': 'Close'
+            })
+            return data
+        except Exception as e:
+            raise RuntimeError(f"Failed to load PreBit dataset: {e}")

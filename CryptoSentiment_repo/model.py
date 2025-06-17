@@ -1,7 +1,7 @@
 ## model.py
 
-import tensorflow as tf
-from transformers import TFBertModel, BertTokenizer
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 import yaml
 
 class Model:
@@ -24,11 +24,13 @@ class Model:
         
         # Initialize the tokenizer and the model based on the type specified
         if self.model_type == 'CryptoBERT':
-            self.tokenizer = BertTokenizer.from_pretrained('vinai/bertweet-base')  # Example model, can be replaced
-            self.bert_model = TFBertModel.from_pretrained('vinai/bertweet-base')
+            self.tokenizer = AutoTokenizer.from_pretrained('vinai/bertweet-base')
+            self.bert_model = AutoModelForSequenceClassification.from_pretrained(
+                'vinai/bertweet-base', num_labels=3)
         elif self.model_type == 'FinBERT':
-            self.tokenizer = BertTokenizer.from_pretrained('yiyanghkust/finbert-tone')  # Example model, can be replaced
-            self.bert_model = TFBertModel.from_pretrained('yiyanghkust/finbert-tone')
+            self.tokenizer = AutoTokenizer.from_pretrained('yiyanghkust/finbert-tone')
+            self.bert_model = AutoModelForSequenceClassification.from_pretrained(
+                'yiyanghkust/finbert-tone', num_labels=3)
         else:
             raise ValueError("Unsupported model type. Choose 'CryptoBERT' or 'FinBERT'.")
 
@@ -50,7 +52,7 @@ class Model:
         prompt = f"Date: {date}, Previous Label: {previous_label}, ROC: {roc}, RSI: {rsi}, Tweet: {tweet_content}"
         
         # Encode the text with tokenizer
-        inputs = self.tokenizer(prompt, return_tensors="tf", padding=True, truncation=True)
+        inputs = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
         
         return inputs
 
@@ -62,8 +64,16 @@ class Model:
             inputs (dict): Tokenized inputs as tensors.
 
         Returns:
-            tf.Tensor: Output logits from the model.
+            torch.Tensor: Output logits from the model.
         """
         # Obtain model output
-        outputs = self.bert_model(inputs)
-        return outputs.last_hidden_state
+        outputs = self.bert_model(**inputs)
+        return outputs.logits
+
+    def freeze_layers(self, freeze_until: int = 11) -> None:
+        """Freeze the first ``freeze_until`` encoder layers."""
+        encoder = self.bert_model.base_model.encoder
+        for layer in encoder.layer[:freeze_until]:
+            for param in layer.parameters():
+                param.requires_grad = False
+

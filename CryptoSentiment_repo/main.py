@@ -26,8 +26,13 @@ def main(config_path: str = 'config.yaml'):
         # Step 1: Data Loading
         logging.info("Loading data...")
         data_loader = DatasetLoader(config_path=config_path)
-        event_data = data_loader.load_event_data()
-        tweet_data = data_loader.load_tweet_data()
+        if data_loader.prebit_dataset_path:
+            dataset = data_loader.load_prebit_data()
+            event_data = dataset
+            tweet_data = dataset
+        else:
+            event_data = data_loader.load_event_data()
+            tweet_data = data_loader.load_tweet_data()
 
         # Step 2: Data Preprocessing
         logging.info("Preprocessing data...")
