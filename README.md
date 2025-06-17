@@ -24,7 +24,7 @@ Outputs (preprocessed files and signals) are saved to the location specified in 
 
 Key Components
 
-DatasetLoader – Reads CSV files from the paths in the config, checking that required columns exist. 
+DatasetLoader – Reads CSV files from the paths in the config, checking that required columns exist. It can load the split PreBit dataset from a directory or a single combined CSV.
 
 Preprocessor – Applies basic NLP cleaning steps (lowercasing, stripping URLs/usernames, removing punctuation, optional lemmatization) and computes technical indicators (RSI, ROC) if price columns exist. Missing values are forward/backward filled, and indicators are min–max normalized. 
 
@@ -42,7 +42,7 @@ Backtester – Uses vectorbt to simulate trading strategies on different predefi
 
 Pointers for Next Steps
 
-Data Acquisition & Paths – The configuration now supports the PreBit multimodal dataset. Set `prebit_dataset_path` in `config.yaml` to the downloaded CSV from Kaggle. If this path is provided the separate tweet and event files are ignored.
+Data Acquisition & Paths – The configuration now supports the PreBit multimodal dataset. You can either provide `prebit_dataset_path` pointing to a single combined CSV or set `prebit_dataset_dir` to the folder containing the yearly `combined_tweets_*_labeled.csv` files and `price_label.csv`. When either PreBit option is supplied the separate tweet and event files are ignored.
 
 Deep Learning Environment – The pipeline has migrated to PyTorch. Install PyTorch and the HuggingFace transformers library. A `requirements.txt` file is recommended.
 

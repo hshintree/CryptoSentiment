@@ -12,12 +12,13 @@ data:
   rsi_threshold: [30, 70]
   roc_window_length: 8  # Assuming based on text
   preprocessing_steps:
-    - text_normalization: true
-    - remove_urls: true
-    - remove_user_ids: true
-    - remove_punctuation: true
-    - lemmatization: true
+    text_normalization: true
+    remove_urls: true
+    remove_user_ids: true
+    remove_punctuation: true
+    lemmatization: true
   prebit_dataset_path: "path/to/prebit.csv"  # Combined dataset from Kaggle
+  prebit_dataset_dir: "path/to/prebit_dir"  # Directory with yearly CSVs
 model:
   type: "CryptoBERT"  # Options: CryptoBERT, FinBERT
   prompt_tuning: true

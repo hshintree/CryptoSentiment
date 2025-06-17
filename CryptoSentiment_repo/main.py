@@ -26,7 +26,7 @@ def main(config_path: str = 'config.yaml'):
         # Step 1: Data Loading
         logging.info("Loading data...")
         data_loader = DatasetLoader(config_path=config_path)
-        if data_loader.prebit_dataset_path:
+        if data_loader.prebit_dataset_path or data_loader.prebit_dataset_dir:
             dataset = data_loader.load_prebit_data()
             event_data = dataset
             tweet_data = dataset
