@@ -7,25 +7,57 @@ from typing import Dict
 
 class MarketLabeler:
     def __init__(self, config_path: str = 'config.yaml'):
-        # Load configuration file
+        """Initialize the labeler with configuration settings."""
         with open(config_path, 'r') as file:
             self.config = yaml.safe_load(file)
 
-        # Extract settings from configuration
         market_labeling_config = self.config.get('market_labeling', {})
         self.strategy = market_labeling_config.get('strategy', 'TBL')
         self.vertical_barrier_range = market_labeling_config.get('barrier_window', '8-15')
         self.vertical_barrier_min, self.vertical_barrier_max = map(int, self.vertical_barrier_range.split('-'))
+        # Multipliers applied to volatility when computing the price barriers
+        self.upper_vol_mult = market_labeling_config.get('upper_vol_mult', 1.0)
+        self.lower_vol_mult = market_labeling_config.get('lower_vol_mult', 1.0)
 
     def label_data(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Apply the Triple Barrier Labeling to assign market-driven labels."""
-        volatility = self.estimate_historical_volatility(data)
-        data['Upper Barrier'] = data['Close'] + (volatility * self.upper_barrier_factor(data))
-        data['Lower Barrier'] = data['Close'] - (volatility * self.lower_barrier_factor(data))
-        data['Vertical Barrier'] = self.vertical_barrier_max
+        """Apply Triple Barrier Labeling with volatility scaling."""
+        volatility = self.estimate_historical_volatility(data).fillna(method='bfill').fillna(method='ffill')
 
-        # Assign labels based on barrier conditions
-        data['Label'] = self.assign_labels(data)
+        labels = []
+        upper_list = []
+        lower_list = []
+        vert_list = []
+
+        for i in range(len(data)):
+            window = np.random.randint(self.vertical_barrier_min, self.vertical_barrier_max + 1)
+            end_idx = min(i + window, len(data) - 1)
+
+            start_price = data.at[i, 'Close']
+            up = start_price * (1 + volatility.iloc[i] * self.upper_vol_mult)
+            down = start_price * (1 - volatility.iloc[i] * self.lower_vol_mult)
+
+            price_path = data.loc[i:end_idx, 'Close']
+
+            bullish = (price_path >= up).any()
+            bearish = (price_path <= down).any()
+
+            if bullish and not bearish:
+                label = 'Bullish'
+            elif bearish and not bullish:
+                label = 'Bearish'
+            else:
+                label = 'Neutral'
+
+            labels.append(label)
+            upper_list.append(up)
+            lower_list.append(down)
+            vert_list.append(end_idx)
+
+        data = data.copy()
+        data['Upper Barrier'] = upper_list
+        data['Lower Barrier'] = lower_list
+        data['Vertical Barrier'] = vert_list
+        data['Label'] = labels
 
         return data
 
@@ -35,34 +67,3 @@ class MarketLabeler:
         volatility = log_returns.ewm(span=30, adjust=False).std()
         return volatility
 
-    def upper_barrier_factor(self, data: pd.DataFrame) -> float:
-        """Calculate the factor for the upper barrier based on market conditions."""
-        # Placeholder for a potentially complex decision algorithm
-        return 1.0
-
-    def lower_barrier_factor(self, data: pd.DataFrame) -> float:
-        """Calculate the factor for the lower barrier based on market conditions."""
-        # Placeholder for a potentially complex decision algorithm
-        return 1.0
-
-    def assign_labels(self, data: pd.DataFrame) -> pd.Series:
-        """Assign labels based on the first barrier touched within the vertical barrier limit."""
-        labels = []
-        for i in range(len(data)):
-            period_data = data.iloc[i:min(i + self.vertical_barrier_max, len(data))]
-            price_path = period_data['Close']
-
-            upper_barrier = data.at[i, 'Upper Barrier']
-            lower_barrier = data.at[i, 'Lower Barrier']
-
-            bullish = (price_path >= upper_barrier).any()
-            bearish = (price_path <= lower_barrier).any()
-
-            if bullish and not bearish:
-                labels.append('Bullish')
-            elif bearish and not bullish:
-                labels.append('Bearish')
-            else:
-                labels.append('Neutral')
-            
-        return pd.Series(labels, index=data.index)

@@ -28,7 +28,7 @@ DatasetLoader – Reads CSV files from the paths in the config, checking that re
 
 Preprocessor – Applies basic NLP cleaning steps (lowercasing, stripping URLs/usernames, removing punctuation, optional lemmatization) and computes technical indicators (RSI, ROC) if price columns exist. Missing values are forward/backward filled, and indicators are min–max normalized. 
 
-MarketLabeler – Implements the “Triple Barrier Labeling” approach. It estimates volatility from log returns and sets dynamic price barriers, then assigns a label (“Bullish”, “Bearish”, “Neutral”) based on which barrier gets hit first within a fixed time window. 
+MarketLabeler – Implements the Triple Barrier Labeling (TBL) approach for short‑term trend detection. Volatility is estimated with an exponential moving standard deviation and is used to scale profit‑taking (upper) and stop‑loss (lower) price barriers. A vertical barrier enforces an observation window of 8‑15 days. Each tweet’s market trend is labeled according to the first barrier touched within that window, yielding “Bullish”, “Bearish”, or “Neutral”.
 
 Model – Wraps either CryptoBERT or FinBERT via HuggingFace. `preprocess_input` embeds market context (date, previous label, RSI, ROC) directly into a text prompt before tokenization.
 
@@ -55,3 +55,14 @@ Expand Evaluation and Experimentation – The model currently outputs BERT hidde
 Project Organization – Tests and a comprehensive README are missing. Adding unit tests for each module and extending the documentation would make the codebase easier to maintain.
 
 By following these pointers—configuring real data, installing the necessary libraries, and gradually refining each stage—you can evolve the current skeleton into a fully functional crypto‑sentiment trading pipeline.
+
+## Running Tests
+
+Basic sanity tests are provided using `pytest`. After installing the project dependencies you can run:
+
+```bash
+python -m py_compile CryptoSentiment_repo/*.py
+pytest -q
+```
+
+This compiles the source files and executes the unit tests found in the `tests/` directory.

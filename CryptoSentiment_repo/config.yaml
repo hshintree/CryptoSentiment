@@ -36,3 +36,5 @@ signal_generation:
 market_labeling:
   strategy: "TBL"  # Triple Barrier Labeling strategy
   barrier_window: 8-15  # Specified in paper
+  upper_vol_mult: 1.0  # Volatility multiplier for upper barrier
+  lower_vol_mult: 1.0  # Volatility multiplier for lower barrier
