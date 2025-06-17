@@ -19,12 +19,11 @@ def test_load_prebit(tmp_path):
         yaml.safe_dump(cfg, f)
 
     loader = DatasetLoader(config_path=str(cfg_path))
-    data = loader.load_prebit_data()
+    data = loader.load_dataset()
     assert {"Tweet Date", "Tweet Content", "Close"} <= set(data.columns)
 
 
 def test_load_prebit_dir(tmp_path):
-    # create tweet csvs
     dir_path = tmp_path / "prebit"
     dir_path.mkdir()
     for year in [2019, 2020]:
@@ -46,6 +45,6 @@ def test_load_prebit_dir(tmp_path):
         yaml.safe_dump(cfg, f)
 
     loader = DatasetLoader(config_path=str(cfg_path))
-    data = loader.load_prebit_data()
+    data = loader.load_dataset()
     assert len(data) == 4
     assert "Close" in data.columns
