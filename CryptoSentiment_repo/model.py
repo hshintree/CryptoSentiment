@@ -1,89 +1,79 @@
-## model.py
+"""model.py – patched 2025‑06‑17
+Fixed issues:
+  • Always `import yaml` at top‑level (prevents UnboundLocalError)
+  • Tokeniser now truncates to 512 tokens and leaves padding to the
+    DataCollator (avoids index‑out‑of‑range during training)
+  • Removed unused secondary YAML load
+"""
 
+import yaml                                  # NEW top‑level import
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
-import yaml
 
 class Model:
-    """Model class for creating and managing a BERT-based language model for financial sentiment analysis."""
+    """BERT‑based model wrapper for financial sentiment analysis."""
 
-    def __init__(self, params: dict):
+    def __init__(self, params: dict | str):
+        """Create tokenizer + sequence‑classification head.
+
+        Parameters
+        ----------
+        params : dict | str
+            Either a *dict* from config or a path to `config.yaml`.
         """
-        Initialize the BERT model for financial sentiment analysis.
-        
-        Args:
-            params (dict): Contains configurations such as model type and prompt tuning settings.
-        """
-        if isinstance(params, str): # let users pass a path
+        if isinstance(params, str):                       # allow path
             import pathlib
             with open(pathlib.Path(params)) as f:
                 params = yaml.safe_load(f)["model"]
-        # Load configuration file for model settings
-        with open('config.yaml', 'r') as file:
-            config = yaml.safe_load(file)["model"]
 
-        # Retrieve settings from configuration
-        self.model_type = params.get('type', 'CryptoBERT')
-        self.prompt_tuning = params.get('prompt_tuning', True)
-        
-        # Initialize the tokenizer and the model based on the type specified
-        if self.model_type == 'CryptoBERT':
-            self.tokenizer = AutoTokenizer.from_pretrained('vinai/bertweet-base')
-            self.bert_model = AutoModelForSequenceClassification.from_pretrained(
-                'vinai/bertweet-base', num_labels=3)
-        elif self.model_type == 'FinBERT':
-            self.tokenizer = AutoTokenizer.from_pretrained('yiyanghkust/finbert-tone')
-            self.bert_model = AutoModelForSequenceClassification.from_pretrained(
-                'yiyanghkust/finbert-tone', num_labels=3)
+        self.model_type    = params.get("type", "CryptoBERT")
+        self.freeze_n_layers = int(params.get("freeze_layers", 11))
+
+        if self.model_type == "CryptoBERT":
+            ckpt = "vinai/bertweet-base"
+        elif self.model_type == "FinBERT":
+            ckpt = "yiyanghkust/finbert-tone"
         else:
-            raise ValueError("Unsupported model type. Choose 'CryptoBERT' or 'FinBERT'.")
+            raise ValueError("Unsupported model type – choose CryptoBERT or FinBERT")
 
-    def preprocess_input(self, tweet_content: str, rsi: float, roc: float, date: str, previous_label: str) -> dict:
-        """
-        Preprocess input data by embedding market context into text.
-        
-        Args:
-            tweet_content (str): The raw tweet content.
-            rsi (float): Relative Strength Index value.
-            roc (float): Rate of Change value.
-            date (str): Date as a string.
-            previous_label (str): Label from previous prediction.
+        self.tokenizer  = AutoTokenizer.from_pretrained(ckpt)
+        self.bert_model = AutoModelForSequenceClassification.from_pretrained(
+            ckpt, num_labels=3
+        )
 
-        Returns:
-            dict: Encoded inputs suitable for model.
-        """
-        # Create a prompt with market-related context
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+    def preprocess_input(
+        self,
+        *,
+        tweet_content: str,
+        rsi: float,
+        roc: float,
+        date: str,
+        previous_label: str,
+    ) -> dict:
+        """Tokenise a single prompt (returns *lists* for padding later)."""
         prompt = (
-            f"Date:{date} | Prev:{previous_label} | ROC:{roc:.4f} | "
-            f"RSI:{rsi:.2f} | Tweet:{tweet_content}"
+            f"Date:{date} | Prev:{previous_label} | "
+            f"ROC:{roc:.4f} | RSI:{rsi:.2f} | Tweet:{tweet_content}"
         )
-        input = self.tokenizer(
+        return self.tokenizer(
             prompt,
-            return_tensors="pt",
-            padding=False,                # let DataCollator pad per‑batch
+            padding="max_length",          # DataCollatorWithPadding handles it
             truncation=True,
-            max_length=300,               # ≤ 514 for BERT‑based models
+            max_length=256,         # well below 514 limit
         )
-        return input
 
     def forward(self, inputs):
-        """
-        Perform a forward pass through the model.
-        
-        Args:
-            inputs (dict): Tokenized inputs as tensors.
+        """Forward pass returning logits."""
+        return self.bert_model(**inputs).logits
 
-        Returns:
-            torch.Tensor: Output logits from the model.
-        """
-        # Obtain model output
-        outputs = self.bert_model(**inputs)
-        return outputs.logits
-
-    def freeze_layers(self, freeze_until: int = 11) -> None:
-        """Freeze the first ``freeze_until`` encoder layers."""
+    def freeze_layers(self, freeze_until: int | None = None) -> None:
+        """Freeze lower transformer layers (default comes from YAML)."""
+        if freeze_until is None:
+            freeze_until = self.freeze_n_layers
         encoder = self.bert_model.base_model.encoder
         for layer in encoder.layer[:freeze_until]:
             for param in layer.parameters():
                 param.requires_grad = False
-

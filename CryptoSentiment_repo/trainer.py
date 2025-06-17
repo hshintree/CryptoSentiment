@@ -102,35 +102,39 @@ class Trainer:
         """Random 20 % time buckets so tweets close in time stay together."""
         return shuffle(df.index.to_numpy()) // max(len(df) // 5, 1)
 
+# ------------------------------------------------------------------ #
+# inside class Trainer
+# ------------------------------------------------------------------ #
     def _make_loader(self, df: pd.DataFrame, *, shuffle: bool) -> DataLoader:
-        encodings, labels = [], []
+        feats, lbls = [], []
         for _, row in df.iterrows():
-            enc = self.model.preprocess_input(
-                tweet_content = row["Tweet Content"],
-                rsi           = row["RSI"],
-                roc           = row["ROC"],
-                date          = row["Tweet Date"].strftime("%Y-%m-%d"),
-                previous_label= row["Previous Label"],
+            feats.append(
+                self.model.preprocess_input(
+                    tweet_content=row["Tweet Content"],
+                    rsi=row["RSI"],
+                    roc=row["ROC"],
+                    date=row["Tweet Date"].strftime("%Y-%m-%d"),
+                    previous_label=row["Previous Label"],
+                )
             )
-            #maybe need to hand *lists* or 1-D tensors to DataCollator so it can pad/truncate, no squeeze
-            encodings.append({k: v.squeeze(0) for k, v in enc.items()})
-            labels.append(0 if row["Label"] == "Bearish"
-                          else 1 if row["Label"] == "Neutral" else 2)
+            lbls.append(
+                0 if row["Label"] == "Bearish"
+                else 1 if row["Label"] == "Neutral" else 2
+            )
 
         class _DS(Dataset):
-            def __init__(self, enc, lab):
-                self.enc, self.lab = enc, lab
-            def __len__(self):  return len(self.lab)
+            def __len__(self):  return len(lbls)
             def __getitem__(self, i):
-                item = {k: v for k, v in self.enc[i].items()}
-                item["labels"] = torch.tensor(self.lab[i])
+                item = {k: torch.tensor(v) for k, v in feats[i].items()}
+                item["labels"] = torch.tensor(lbls[i])
                 return item
-        # Pad sequences in each mini-batch so tensor lengths match
-        collator = DataCollatorWithPadding(tokenizer=self.model.tokenizer)
-        return DataLoader(_DS(encodings, labels),
-                          batch_size=self.batch_size,
-                          shuffle=shuffle,
-                          collate_fn=collator)
+
+        return DataLoader(
+            _DS(),
+            batch_size=self.batch_size,
+            shuffle=shuffle,
+        )
+
 
     def _train_one_epoch(self, loader: DataLoader) -> None:
         for step, batch in enumerate(loader):
@@ -140,6 +144,8 @@ class Trainer:
             loss.backward()
             self.optimizer.step();  self.scheduler.step()
             self.optimizer.zero_grad()
+            if step == 0:                    # print once per epoch
+                 print("shape :", batch["input_ids"].shape)   # e.g. torch.Size([4, 256])
             if step % 10 == 0:
                 print(f"    step {step:<4}  loss {loss.item():.4f}")
 

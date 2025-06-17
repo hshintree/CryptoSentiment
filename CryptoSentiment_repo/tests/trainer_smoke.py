@@ -17,4 +17,5 @@ data['Previous Label'] = data['Label'].shift(1).fillna('Neutral')   # quick fix
 model = Model("config.yaml")    # however you construct it
 trainer = Trainer(model, data, "config.yaml")
 trainer._prepare_data(data)     # should run with no errors
+trainer.train()
 print("✅ trainer smoke-prep passed")
