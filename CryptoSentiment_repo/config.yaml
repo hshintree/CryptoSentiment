@@ -1,0 +1,37 @@
+## config.yaml
+training:
+  learning_rate: 1e-5
+  batch_size: 12
+  epochs: 2
+  optimizer: AdamW
+  warmup_steps: 0.1  # 10% of total training steps
+data:
+  bitcoin_events_path: "path/to/bitcoin_historical_events.csv"  # Replace with actual path
+  tweets_data_path: "path/to/tweet_data.csv"  # Replace with actual path
+  output_data_path: "path/to/output"  # Path to save processed data
+  rsi_threshold: [30, 70]
+  roc_window_length: 8  # Assuming based on text
+  preprocessing_steps:
+    - text_normalization: true
+    - remove_urls: true
+    - remove_user_ids: true
+    - remove_punctuation: true
+    - lemmatization: true
+model:
+  type: "CryptoBERT"  # Options: CryptoBERT, FinBERT
+  prompt_tuning: true
+backtesting:
+  using_library: "vectorbt"
+evaluation:
+  metrics:
+    - accuracy
+    - precision
+    - recall
+    - f1_score
+signal_generation:
+  methods:
+    - majority
+    - mean
+market_labeling:
+  strategy: "TBL"  # Triple Barrier Labeling strategy
+  barrier_window: 8-15  # Specified in paper
