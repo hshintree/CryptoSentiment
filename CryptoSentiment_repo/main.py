@@ -27,8 +27,10 @@ def main(config_path: str = 'config.yaml'):
         logging.info("Loading data...")
         data_loader = DatasetLoader(config_path=config_path)
         dataset = data_loader.load_dataset()
-        event_data = dataset
-        tweet_data = dataset
+        
+        # Split dataset into events and tweets based on data source
+        event_data = dataset[dataset['data_source'] == 'prebit'].copy()
+        tweet_data = dataset[dataset['data_source'] == 'kaggle'].copy()
 
         # Step 2: Data Preprocessing
         logging.info("Preprocessing data...")

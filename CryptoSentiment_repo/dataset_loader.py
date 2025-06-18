@@ -135,7 +135,7 @@ class DatasetLoader:
 
     def _load_single_prebit(self) -> pd.DataFrame:
         """Load the (older) *single‑CSV* version of the PreBit dataset."""
-        csv_path = Path(self.prebit_dataset_path)
+        csv_path = Path(self.prebit_dir)
         if not csv_path.exists():
             raise FileNotFoundError(csv_path)
 

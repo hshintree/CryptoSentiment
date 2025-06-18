@@ -3,12 +3,6 @@ import numpy as np
 from pathlib import Path
 import sys
 from datetime import datetime
-from big_loader import BigLoader
-from market_labeler import MarketLabeler
-from dataset_loader import DatasetLoader
-
-# Add parent directory to path to import modules
-sys.path.append(str(Path(__file__).parent.parent))
 from eval_loader import EvalLoader
 
 def test_ea_dataset_properties():
@@ -16,10 +10,7 @@ def test_ea_dataset_properties():
     print("\n=== Testing Ea Dataset Properties ===")
     
     # Load datasets
-    load = DatasetLoader("config.yaml")
-    load.load_dataset()
-    big_load = BigLoader(load)
-    loader = EvalLoader(big_load)
+    loader = EvalLoader("config.yaml")
     datasets = loader.create_eval_datasets()
     ea_df = datasets['ea_full']
     
@@ -52,7 +43,7 @@ def test_eb_dataset_properties():
     print("\n=== Testing Eb Dataset Properties ===")
     
     # Load datasets
-    loader = EvalLoader(BigLoader(DatasetLoader("config.yaml")))
+    loader = EvalLoader("config.yaml")
     datasets = loader.create_eval_datasets()
     eb_df = datasets['eb_full']
     
@@ -87,7 +78,7 @@ def test_fold_integrity():
     """Test the integrity of time-series folds."""
     print("\n=== Testing Fold Integrity ===")
     
-    loader = EvalLoader()
+    loader = EvalLoader("config.yaml")
     datasets = loader.create_eval_datasets()
     
     # Test Ea folds
