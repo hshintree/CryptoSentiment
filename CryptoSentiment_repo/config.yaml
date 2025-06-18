@@ -5,9 +5,17 @@ training:
   optimizer: AdamW
   warmup_steps: 0.1  # 10% of total training steps
 data:
-  bitcoin_events_path: "path/to/bitcoin_historical_events.csv"  # Replace with actual path
-  tweets_data_path: "path/to/tweet_data.csv"  # Replace with actual path
-  output_data_path: "path/to/output"  # Path to save processed data
+  bitcoin_events_path: "/Users/hakeemshindy/Downloads/bitcoin_events.csv"  
+  # Kaggle tweets (point at the folder containing your two CSVs)
+  kaggle_dataset_dir: "/Users/hakeemshindy/Downloads/kaggle_tweet" 
+
+  output_data_path: "/Users/hakeemshindy/Desktop/CryptoSentiment/CryptoSentiment_repo/data/output"  # Path to save processed data
+  prebit_dataset_path: null  # Combined dataset from Kaggle
+
+  prebit_dataset_dir: "/Users/hakeemshindy/Downloads/prebit_dir"  # Directory with yearly CSVs
+
+  price_label_path:   "/Users/hakeemshindy/Downloads/btc_price/price_label.csv"
+
   rsi_threshold: [30, 70]
   roc_window_length: 8  # Assuming based on text
   preprocessing_steps:
@@ -16,8 +24,6 @@ data:
     remove_user_ids: true
     remove_punctuation: true
     lemmatization: true
-  prebit_dataset_path: null  # Combined dataset from Kaggle
-  prebit_dataset_dir: "/Users/hakeemshindy/Downloads/prebit_dir"  # Directory with yearly CSVs
 model:
   type: "CryptoBERT"           # CryptoBERT ≡ BERTweet maybe FinBERT
   pretrained_name: "vinai/bertweet-base"

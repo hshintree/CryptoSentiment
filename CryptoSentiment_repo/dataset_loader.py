@@ -1,146 +1,133 @@
-"""dataset_loader.py
-
-Enhanced dataset loader to handle the PreBit Bitcoin multimodal dataset
-distributed on Kaggle (https://www.kaggle.com/datasets/zyz5557585/prebit-multimodal-dataset-for-bitcoin-price).
-
-Key improvements over the previous version:
-
-1. **Directory‑based loading** – Seamlessly loads yearly tweet CSVs that follow
-   the pattern `combined_tweets_<YEAR>_labeled.csv` *and* the accompanying
-   `price_label.csv`.
-2. **Automatic label discovery** – Keeps *all* `label_*` columns and merges the
-   tweet‑level labels with the price labels (suffixing clashes where needed).
-3. **Config‑driven** – No hard‑coded paths.  Use `config.yaml → data →
-   prebit_dataset_dir` (preferred) or set `prebit_dataset_path` for the single‑csv
-   variant.
-4. **Flexible aggregation** – Allows the caller to keep the raw many‑tweets‑per‑day
-   format **or** aggregate to a single row per date with a custom reducer.
-5. **Robustness** –  Clear validation of required columns and helpful error
-   messages.
-
-Example `config.yaml` snippet:
-
-```yaml
-# config.yaml
- data:
-   prebit_dataset_dir: "/Users/hakeemshindy/Downloads/archive"
-   preprocessing_steps:
-     text_normalization: true
-     remove_urls: true
- market_labeling:
-   strategy: "TBL"
-``` 
-
-Usage:
-
-```python
-from dataset_loader import DatasetLoader
-
-d loader = DatasetLoader("config.yaml")
-# Keep raw tweets
-raw = loader.load_dataset()
-
-# One‑row‑per‑day aggregation and simple majority vote on labels
-agg = loader.load_dataset(aggregate=True)
-```
-"""
-
-from __future__ import annotations
-
 import glob
-import os
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional
+from typing import Callable, Iterable, List, Optional, Union, TYPE_CHECKING
 
 import pandas as pd
 import yaml
 
-# ---------------------------------------------------------------------------
-# Helper utilities
-# ---------------------------------------------------------------------------
+if TYPE_CHECKING:
+    from dataset_loader import DatasetLoader
+
+def _discover_label_cols(columns: Iterable[str]) -> List[str]:
+    """Find all columns that look like labels."""
+    return [c for c in columns if c.lower() in ("label", "sentiment", "class")]
 
 def _find_close_col(df: pd.DataFrame) -> str:
-    """Return the name of the column that stores the daily *close* price."""
-    for candidate in ("Close_x", "close", "Close"):
-        if candidate in df.columns:
-            return candidate
-    raise ValueError("Could not identify close price column (expected one of Close_x/close/Close)")
-
-
-def _discover_label_cols(cols: Iterable[str]) -> List[str]:
-    """Return all column names that start with the Kaggle ‑style label prefix."""
-    return [c for c in cols if c.startswith("label_")]
-
-
-# ---------------------------------------------------------------------------
-# Main loader
-# ---------------------------------------------------------------------------
+    """Find the column name for closing price."""
+    close_cols = [c for c in df.columns if c.lower() in ("close", "closing", "price")]
+    if not close_cols:
+        raise ValueError("No closing price column found")
+    return close_cols[0]
 
 class DatasetLoader:
-    """Load PreBit multimodal dataset (tweets + price + labels).
-
-    Parameters
-    ----------
-    config_path : str, default ``"config.yaml"``
-        Path to a YAML config file containing at least the **data** section.
-    include_labels : bool, default ``True``
-        If *False*, drop the ``label_*`` columns entirely.
-    label_reducer : Optional[Callable[[pd.Series], float|int|str]]
-        If ``aggregate`` (see :py:meth:`load_dataset`) is ``True`` *and*
-        ``include_labels`` is ``True``, this reducer is applied to every label
-        column to go from many tweets per day → a single value per day.  By
-        default a simple *mode* is used (majority vote).
-    """
-
     def __init__(
         self,
-        config_path: str = "config.yaml",
+        config_path_or_loader: Union[str, "DatasetLoader"] = "config.yaml",
         *,
         include_labels: bool = True,
-        label_reducer: Optional[Callable[[pd.Series], float | int | str]] = None,
-    ) -> None:
+        label_reducer: Optional[Callable[[pd.Series], Union[float, int, str]]] = None,
+    ):
+        print(f"DatasetLoader.__init__ called with: {config_path_or_loader}")
+        
+        if isinstance(config_path_or_loader, DatasetLoader):
+            # Copy attributes from existing loader
+            print("Copying attributes from existing DatasetLoader")
+            self.prebit_dir = config_path_or_loader.prebit_dir
+            self.price_path = config_path_or_loader.price_path
+            self.kaggle_dir = config_path_or_loader.kaggle_dir
+            self.events_path = config_path_or_loader.events_path
+        else:
+            # Load from config file
+            print(f"Loading config from: {config_path_or_loader}")
+            with open(config_path_or_loader, "r") as f:
+                cfg = yaml.safe_load(f)
+            d = cfg["data"]
+
+            # PreBit directories / single file
+            self.prebit_dir    = Path(d["prebit_dataset_dir"])
+            self.price_path    = Path(d["price_label_path"])
+            self.kaggle_dir    = Path(d["kaggle_dataset_dir"])
+            self.events_path   = Path(d["bitcoin_events_path"])
+
         self.include_labels = include_labels
-        self.label_reducer = label_reducer or (lambda s: s.mode().iat[0] if not s.mode().empty else s.iloc[0])
-
-        # ------------------------------------------------------------------
-        # Read configuration
-        # ------------------------------------------------------------------
-        with open(config_path, "r") as f:
-            cfg = yaml.safe_load(f)
-
-        data_cfg = cfg.get("data", {})
-        self.prebit_dataset_path: Optional[str] = data_cfg.get("prebit_dataset_path")
-        self.prebit_dataset_dir: Optional[str] = data_cfg.get("prebit_dataset_dir")
-
-        if not (self.prebit_dataset_path or self.prebit_dataset_dir):
-            raise ValueError(
-                "Specify either 'prebit_dataset_path' (single‑CSV) or 'prebit_dataset_dir' (directory) in config.yaml → data"
-            )
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        self.label_reducer  = label_reducer or (lambda s: s.mode().iat[0] if not s.mode().empty else s.iloc[0])
+        
+        print(f"DatasetLoader initialized with paths:")
+        print(f"  prebit_dir: {self.prebit_dir}")
+        print(f"  price_path: {self.price_path}")
+        print(f"  kaggle_dir: {self.kaggle_dir}")
+        print(f"  events_path: {self.events_path}")
 
     def load_dataset(self, *, aggregate: bool = False) -> pd.DataFrame:
-        """Load tweets (+ price) with optional per‑day aggregation.
+        # -- 1) Load PreBit tweets (2015-2021) --
+        prebit_df = None
+        if self.prebit_dir:
+            prebit_df = self._load_prebit_dir()
+            prebit_df = prebit_df.rename(columns={"Tweet Date": "date"})
+            # Flag tweets from PreBit dataset
+            prebit_df["data_source"] = "prebit"
+            # Set metadata columns to NaN for PreBit tweets
+            for col in ["hashtags", "is_retweet", "user_verified", "user_followers"]:
+                prebit_df[col] = pd.NA
 
-        Parameters
-        ----------
-        aggregate : bool, default ``False``
-            If *True*, collapse multiple tweets on the same date into a single
-            row.  Numerical columns are *mean*‑aggregated, string columns are
-            concatenated with ``" \n"`` separators, and label columns use
-            :pyattr:`label_reducer`.
-        """
-        if self.prebit_dataset_path:
-            df = self._load_single_prebit()
+        # -- 2) Load Kaggle tweets (2021-2023) with rich metadata --
+        kaggle_df = None
+        if self.kaggle_dir:
+            kaggle_df = self._load_kaggle_tweets()
+            kaggle_df = kaggle_df.rename(columns={"Tweet Date": "date"})
+            kaggle_df["data_source"] = "kaggle"
+            # Ensure all metadata columns exist (even if not in source)
+            for col in ["hashtags", "is_retweet", "user_verified", "user_followers"]:
+                if col not in kaggle_df.columns:
+                    kaggle_df[col] = pd.NA
+
+        # -- 3) Combine all tweets --
+        parts = []
+        if prebit_df is not None:
+            parts.append(prebit_df)
+        if kaggle_df is not None:
+            parts.append(kaggle_df)
+        df = pd.concat(parts, ignore_index=True).sort_values("date")
+
+        # -- 4) Merge price data with ALL tweets --
+        price_df = self._load_price_data()
+        df = pd.merge(df, price_df, on="date", how="left")
+
+        # -- 5) Add metadata availability flags --
+        df["has_user_metadata"] = df["user_followers"].notna()
+        df["has_tweet_metadata"] = df["hashtags"].notna()
+
+        # -- 6) Merge in events as a one-hot Is_Event flag --
+        if self.events_path:
+            events_df = self._load_events_data()
+            df["Is_Event"] = df["date"].isin(events_df["date"]).astype(int)
         else:
-            df = self._load_prebit_dir()
+            df["Is_Event"] = 0
 
+        # -- 7) Per-day aggregation if requested --
         if aggregate:
             df = self._aggregate_per_day(df)
 
         return df
+
+    def _load_kaggle_tweets(self) -> pd.DataFrame:
+        """Load the additional Kaggle tweets CSV—must have date + text col."""
+        df = pd.read_csv(Path(self.kaggle_file), parse_dates=["date","Date","Tweet Date"], dayfirst=False)
+
+        # Find a text column
+        text_cols = [c for c in df.columns if c.lower() in ("text","tweet","text_split")]
+        if not text_cols:
+            raise ValueError("No tweet/text column found in Kaggle CSV")
+        text_col = text_cols[0]
+
+        df = df.rename(columns={text_col:"Tweet Content", "date":"Tweet Date","Date":"Tweet Date"})
+        # if labels present, keep them
+        if not self.include_labels:
+            df = df.drop(columns=_discover_label_cols(df.columns), errors="ignore")
+
+        return df[["Tweet Date","Tweet Content"] + _discover_label_cols(df.columns)]
+
+    # -- reuse existing _load_single_prebit, _load_prebit_dir, _aggregate_per_day --  
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -235,3 +222,24 @@ class DatasetLoader:
 
         grouped = df.groupby("Tweet Date", as_index=False).agg(_agg_fn)
         return grouped
+
+    def _load_price_data(self) -> pd.DataFrame:
+        """
+        Load daily close price data, renaming the time and close columns to 'date' and 'Close'.
+        Returns a DataFrame with 'date', 'Close', and 'Volume' columns.
+        """
+        df = pd.read_csv(self.price_path, parse_dates=["Open time"])
+        # Rename columns for consistency
+        df = df.rename(columns={"Open time": "date", "Close": "Close", "Volume": "Volume"})
+        # Keep date, Close and Volume columns
+        return df[["date", "Close", "Volume"]]
+
+    def _load_events_data(self) -> pd.DataFrame:
+        """
+        Load the events CSV and return a DataFrame with a 'date' column.
+        """
+        df = pd.read_csv(self.events_path, parse_dates=["Date", "date"])
+        if "Date" in df.columns:
+            df = df.rename(columns={"Date": "date"})
+        return df[["date"]].drop_duplicates()
+

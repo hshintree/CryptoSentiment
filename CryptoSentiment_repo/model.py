@@ -39,6 +39,7 @@ class Model:
         roc: float,
         date: str,
         previous_label: str,
+        log_volume: float | None = None,
     ) -> dict:
         """
         Tokenise prompt and return fixed-length tensors.
@@ -46,9 +47,14 @@ class Model:
         Dynamically queries the model's max_position_embeddings so we
         never exceed the embedding-matrix range, even if it's <256.
         """
+        # Include volume info in prompt if available
+        volume_info = ""
+        if log_volume is not None:
+            volume_info = f" | Vol(log):{log_volume:.2f}"
+            
         prompt = (
             f"Date:{date} | Prev:{previous_label} | "
-            f"ROC:{roc:.4f} | RSI:{rsi:.2f} | Tweet:{tweet_content}"
+            f"ROC:{roc:.4f} | RSI:{rsi:.2f}{volume_info} | Tweet:{tweet_content}"
         )
         # determine safe length
         max_pos = self.bert_model.config.max_position_embeddings
@@ -67,6 +73,12 @@ class Model:
         position_ids = torch.arange(max_len, dtype=torch.long)
         position_ids = position_ids.unsqueeze(0).expand_as(tokenized["input_ids"])
         tokenized["position_ids"] = position_ids
+        
+        # Add numeric features if available
+        if log_volume is not None:
+            tokenized["numeric_features"] = torch.tensor([[rsi, roc, log_volume]], dtype=torch.float)
+        else:
+            tokenized["numeric_features"] = torch.tensor([[rsi, roc]], dtype=torch.float)
         
         return tokenized
 
