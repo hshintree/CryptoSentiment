@@ -1,33 +1,23 @@
-"""model.py – patched 2025‑06‑17
-Fixed issues:
-  • Always `import yaml` at top‑level (prevents UnboundLocalError)
-  • Tokeniser now truncates to 512 tokens and leaves padding to the
-    DataCollator (avoids index‑out‑of‑range during training)
-  • Removed unused secondary YAML load
+"""model.py – dynamic max_length fix
+• Now reads config.max_position_embeddings at runtime
+• Caps token length to the *minimum* of 256 and max_position_embeddings
 """
 
-import yaml                                  # NEW top‑level import
+import yaml
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 class Model:
-    """BERT‑based model wrapper for financial sentiment analysis."""
+    """BERT-based model wrapper for financial sentiment analysis."""
 
     def __init__(self, params: dict | str):
-        """Create tokenizer + sequence‑classification head.
-
-        Parameters
-        ----------
-        params : dict | str
-            Either a *dict* from config or a path to `config.yaml`.
-        """
-        if isinstance(params, str):                       # allow path
+        if isinstance(params, str):
             import pathlib
             with open(pathlib.Path(params)) as f:
                 params = yaml.safe_load(f)["model"]
 
-        self.model_type    = params.get("type", "CryptoBERT")
-        self.freeze_n_layers = int(params.get("freeze_layers", 11))
+        self.model_type       = params.get("type", "CryptoBERT")
+        self._n_freeze_layers = int(params.get("freeze_layers", 11))
 
         if self.model_type == "CryptoBERT":
             ckpt = "vinai/bertweet-base"
@@ -41,9 +31,6 @@ class Model:
             ckpt, num_labels=3
         )
 
-    # ------------------------------------------------------------------
-    # Public helpers
-    # ------------------------------------------------------------------
     def preprocess_input(
         self,
         *,
@@ -53,27 +40,45 @@ class Model:
         date: str,
         previous_label: str,
     ) -> dict:
-        """Tokenise a single prompt (returns *lists* for padding later)."""
+        """
+        Tokenise prompt and return fixed-length tensors.
+
+        Dynamically queries the model's max_position_embeddings so we
+        never exceed the embedding-matrix range, even if it's <256.
+        """
         prompt = (
             f"Date:{date} | Prev:{previous_label} | "
             f"ROC:{roc:.4f} | RSI:{rsi:.2f} | Tweet:{tweet_content}"
         )
-        return self.tokenizer(
+        # determine safe length
+        max_pos = self.bert_model.config.max_position_embeddings
+        max_len = min(128, max_pos)  # Reduced from 256 to 128 to be safe
+
+        # Get tokenizer output
+        tokenized = self.tokenizer(
             prompt,
-            padding="max_length",          # DataCollatorWithPadding handles it
+            padding="max_length",
             truncation=True,
-            max_length=256,         # well below 514 limit
+            max_length=max_len,
+            return_tensors="pt",
         )
+        
+        # Create position IDs
+        position_ids = torch.arange(max_len, dtype=torch.long)
+        position_ids = position_ids.unsqueeze(0).expand_as(tokenized["input_ids"])
+        tokenized["position_ids"] = position_ids
+        
+        return tokenized
 
     def forward(self, inputs):
         """Forward pass returning logits."""
         return self.bert_model(**inputs).logits
 
     def freeze_layers(self, freeze_until: int | None = None) -> None:
-        """Freeze lower transformer layers (default comes from YAML)."""
+        """Freeze lower transformer blocks."""
         if freeze_until is None:
-            freeze_until = self.freeze_n_layers
+            freeze_until = self._n_freeze_layers
         encoder = self.bert_model.base_model.encoder
         for layer in encoder.layer[:freeze_until]:
-            for param in layer.parameters():
-                param.requires_grad = False
+            for p in layer.parameters():
+                p.requires_grad = False

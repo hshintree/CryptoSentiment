@@ -80,8 +80,8 @@ class Trainer:
                 print(f"  Epoch {epoch+1}/{self.epochs}")
                 self._train_one_epoch(loop)
                 self._evaluate(va_loader)
-                # keep a lightweight reference for later voting
-                self.fold_states.append({"model": self.model})
+            # keep a lightweight reference for later voting
+            self.fold_states.append({"model": self.model})
         if hasattr(self, "fold_states"):
             pred_df = cross_val_predict(self, data)
             pred_df.to_csv("signals_per_tweet.csv", index=False)
@@ -102,21 +102,21 @@ class Trainer:
         """Random 20 % time buckets so tweets close in time stay together."""
         return shuffle(df.index.to_numpy()) // max(len(df) // 5, 1)
 
-# ------------------------------------------------------------------ #
-# inside class Trainer
-# ------------------------------------------------------------------ #
+
     def _make_loader(self, df: pd.DataFrame, *, shuffle: bool) -> DataLoader:
         feats, lbls = [], []
         for _, row in df.iterrows():
-            feats.append(
-                self.model.preprocess_input(
-                    tweet_content=row["Tweet Content"],
-                    rsi=row["RSI"],
-                    roc=row["ROC"],
-                    date=row["Tweet Date"].strftime("%Y-%m-%d"),
-                    previous_label=row["Previous Label"],
-                )
+            tok = self.model.preprocess_input(
+                tweet_content=row["Tweet Content"],
+                rsi=row["RSI"],
+                roc=row["ROC"],
+                date=row["Tweet Date"].strftime("%Y-%m-%d"),
+                previous_label=row["Previous Label"],
             )
+            # Remove token_type_ids and keep other tensors as is
+            if "token_type_ids" in tok:
+                del tok["token_type_ids"]
+            feats.append(tok)
             lbls.append(
                 0 if row["Label"] == "Bearish"
                 else 1 if row["Label"] == "Neutral" else 2
@@ -125,7 +125,7 @@ class Trainer:
         class _DS(Dataset):
             def __len__(self):  return len(lbls)
             def __getitem__(self, i):
-                item = {k: torch.tensor(v) for k, v in feats[i].items()}
+                item = {k: v[0] for k, v in feats[i].items()}  # Remove batch dimension
                 item["labels"] = torch.tensor(lbls[i])
                 return item
 
@@ -136,16 +136,23 @@ class Trainer:
         )
 
 
+
     def _train_one_epoch(self, loader: DataLoader) -> None:
         for step, batch in enumerate(loader):
+            if step == 0:                    # print once per epoch
+                print("vocab_size:", self.model.tokenizer.vocab_size)
+                print(" BATCH KEYS:", batch.keys())
+                print("  input_ids  max id:", batch["input_ids"].max().item())
+                print("  input_ids  shape:", batch["input_ids"].shape)
+                # If you have an attention_mask, print its dtype & shape:
+                if "attention_mask" in batch:
+                    print("  attn_mask shape:", batch["attention_mask"].shape)
             lbls  = batch.pop("labels")
             outs  = self.model.bert_model(**batch)
             loss  = torch.nn.functional.cross_entropy(outs.logits, lbls)
             loss.backward()
             self.optimizer.step();  self.scheduler.step()
             self.optimizer.zero_grad()
-            if step == 0:                    # print once per epoch
-                 print("shape :", batch["input_ids"].shape)   # e.g. torch.Size([4, 256])
             if step % 10 == 0:
                 print(f"    step {step:<4}  loss {loss.item():.4f}")
 
@@ -180,13 +187,19 @@ def cross_val_predict(trainer: "Trainer",
         model.bert_model.eval()
         with torch.no_grad():
             for batch_idx, batch in enumerate(loader):
-                idx   = batch_idx              # 1-to-1 because no shuffle
+                # Get the actual indices for this batch
+                start_idx = batch_idx * trainer.batch_size
+                indices = range(start_idx, min(start_idx + len(batch["input_ids"]), len(data)))
+                
                 logits = model.bert_model(**{k: v for k, v in batch.items()
                                              if k != "labels"}).logits
                 probs  = torch.softmax(logits, dim=-1)
-                pred   = probs.argmax(dim=-1).item()
-                votes[idx].append(pred)
-                confs[idx].append(probs[0, pred].item())
+                preds  = probs.argmax(dim=-1)
+                
+                # Process each sample in the batch
+                for i, (idx, pred) in enumerate(zip(indices, preds)):
+                    votes[idx].append(pred.item())
+                    confs[idx].append(probs[i, pred].item())
 
     # majority + avg-confidence
     maj_lbl = {i: max(set(votes[i]), key=votes[i].count) for i in votes}

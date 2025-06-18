@@ -76,6 +76,7 @@ class MarketLabeler:
 
         # pre‑allocate
         upper, lower, label = np.empty(len(df)), np.empty(len(df)), np.empty(len(df), dtype=object)
+        vertical_barrier = np.empty(len(df))  # Add array for vertical barrier values
 
         # --- rolling optimisation -------------------------------------
         n = len(df)
@@ -91,10 +92,11 @@ class MarketLabeler:
             # apply TBL with optimal params to current slice
             u, l, lab = self._apply_tbl(win_prices, fu, fl, vt)
             upper[start:end], lower[start:end], label[start:end] = u, l, lab
+            vertical_barrier[start:end] = vt  # Store vt for this slice
 
         df["Upper Barrier"] = upper
         df["Lower Barrier"] = lower
-        df["Vertical Barrier"] = vt  # constant within slice (last vt)
+        df["Vertical Barrier"] = vertical_barrier  # Use the slice-specific values
         df["Label"] = label
         return df
 
