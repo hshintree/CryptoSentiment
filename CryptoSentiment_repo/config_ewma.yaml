@@ -42,11 +42,19 @@ signal_generation:
     - majority
     - mean
 market_labeling:
-  strategy: "TBL"  # Triple Barrier Labeling strategy
+  strategy: "TBL_EWMA"  # Enhanced Triple Barrier Labeling with EWMA volatility
   barrier_window: 8-15  # Specified in paper
   upper_vol_mult: 1.0  # Volatility multiplier for upper barrier
   lower_vol_mult: 1.0  # Volatility multiplier for lower barrier
-  fu_grid: [0.03, 0.05, 0.07]
-  fl_grid: [0.03, 0.05, 0.07]
-  vt_grid: [5, 10]
-  rebalance_days: 126
+  # VOLATILITY MULTIPLIERS (not fixed percentages)
+  # Barriers will be: Uₜ = Pₜ + Pₜ·σₜ·Fᵤ, Lₜ = Pₜ – Pₜ·σₜ·Fₗ
+  fu_grid: [0.5, 1.0, 1.5, 2.0]   # Upper volatility multipliers
+  fl_grid: [0.5, 1.0, 1.5, 2.0]   # Lower volatility multipliers  
+  vt_grid: [3, 5, 7, 10]          # Vertical barrier horizons (days)
+  rebalance_days: 126             # Re-optimize every 6 months
+  
+  # EWMA parameters
+  ewma_tau: 30                    # 30-day EWMA decay parameter
+  min_trend_days: 2               # Minimum days before allowing barrier hits
+  roc_window: 8                   # ROC calculation window
+  risk_free_rate: 0.04            # Annual risk-free rate for Sharpe calculation 

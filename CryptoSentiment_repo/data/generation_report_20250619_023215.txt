@@ -1,0 +1,48 @@
+================================================================================
+📊 EVALUATION DATASETS GENERATION SUMMARY REPORT
+================================================================================
+Generated: 2025-06-19 02:33:14
+Timestamp: 20250619_023215
+
+📋 DATASET OVERVIEW:
+----------------------------------------
+Ea dataset (2020 training): 23,790 tweets
+Eb dataset (event evaluation): 40,000 tweets
+Daily aggregated dataset: 2,125 days
+Cross-validation folds: 5 folds per dataset
+
+📊 LABEL DISTRIBUTIONS:
+----------------------------------------
+Ea dataset (2020 training):
+  Bullish: 7,930 tweets (33.3%)
+  Bearish: 7,930 tweets (33.3%)
+  Neutral: 7,930 tweets (33.3%)
+Eb dataset (event evaluation):
+  Bearish: 17,381 tweets (43.5%)
+  Bullish: 13,159 tweets (32.9%)
+  Neutral: 9,460 tweets (23.6%)
+
+✅ VALIDATION RESULTS:
+----------------------------------------
+🎉 ALL VALIDATION CHECKS PASSED!
+Ea size validation: ✅
+Ea balance validation: ✅
+Eb size validation: ✅
+Eb event focus validation: ✅
+
+📁 SAVED FILES:
+----------------------------------------
+Main datasets: 4 files
+CV folds: 20 files
+Total files: 24 files
+
+🔑 KEY FILES:
+----------------------------------------
+  ea_full: data/ea_dataset_2020_training_20250619_023215.csv
+  eb_full: data/eb_dataset_event_evaluation_20250619_023215.csv
+  all_data: data/aggregated_daily_dataset_20250619_023215.csv
+  index: data/dataset_index_20250619_023215.csv
+
+================================================================================
+🚀 DATASETS READY FOR PAPER IMPLEMENTATION!
+================================================================================

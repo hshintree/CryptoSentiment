@@ -1,0 +1,449 @@
+"""market_labeler_ewma.py
+
+Enhanced Triple‑Barrier labeler with EWMA volatility and proper financial formulas.
+
+Fixed Triple‑Barrier labeler that properly handles intra-day data.
+
+The key fix: When multiple tweets exist on the same day, all tweets on that day
+should look at the SAME future price path (next unique trading days), not the
+next rows in the dataset.
+^^^^It should do this at least^^^
+Key features:
+- 30-day EWMA volatility σₜ from log-returns
+- Volatility-adjusted barriers: Uₜ = Pₜ + Pₜ·σₜ·Fᵤ, Lₜ = Pₜ – Pₜ·σₜ·Fₗ
+- 2-day minimum trend enforcement (label as Neutral if hit before day 2)
+- 8-day ROC window with ±1σ thresholds
+- Risk-adjusted Sharpe: (returns - 4% risk-free) / std * √252
+- Maintains "next Vₜ trading days" logic for intra-day data
+"""
+
+from __future__ import annotations
+
+import itertools
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+import yaml
+
+# ---------------------------------------------------------------------------
+# Configuration dataclass ----------------------------------------------------
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _TBLConfig:
+    fu_grid: list[float]  # e.g. [0.5, 1.0, 1.5] (volatility multipliers)
+    fl_grid: list[float]  # e.g. [0.5, 1.0, 1.5] (volatility multipliers)
+    vt_grid: list[int]    # e.g. [3, 5, 7] (days)
+    rebalance_days: int   # optimise every N obs (≈ 126 for 6 months)
+
+    @classmethod
+    def from_yaml(cls, path: str = "config.yaml") -> "_TBLConfig":
+        cfg = yaml.safe_load(open(path))
+        mkt = cfg.get("market_labeling", {})
+        return cls(
+            fu_grid=mkt.get("fu_grid", [0.5, 1.0, 1.5]),
+            fl_grid=mkt.get("fl_grid", [0.5, 1.0, 1.5]),
+            vt_grid=mkt.get("vt_grid", [3, 5, 7]),
+            rebalance_days=mkt.get("rebalance_days", 126),
+        )
+
+# ---------------------------------------------------------------------------
+# Enhanced financial calculations ----------------------------------------
+# ---------------------------------------------------------------------------
+
+def _compute_ewma_volatility(prices: np.ndarray, tau: int = 30) -> np.ndarray:
+    """
+    Compute 30-day EWMA volatility from log-returns.
+    
+    Args:
+        prices: Daily price series
+        tau: EWMA decay parameter (30 days)
+    
+    Returns:
+        EWMA volatility series (same length as prices, first values are NaN)
+    """
+    if len(prices) < 2:
+        return np.full(len(prices), np.nan)
+    
+    # Compute log returns
+    log_returns = np.diff(np.log(prices))
+    
+    # EWMA parameters
+    alpha = 2.0 / (tau + 1)  # Decay factor
+    
+    # Initialize EWMA volatility array
+    ewma_vol = np.full(len(prices), np.nan)
+    
+    if len(log_returns) == 0:
+        return ewma_vol
+    
+    # Initialize with first return's squared value
+    ewma_var = log_returns[0] ** 2
+    ewma_vol[1] = np.sqrt(ewma_var)
+    
+    # Compute EWMA variance recursively
+    for i in range(1, len(log_returns)):
+        ewma_var = alpha * (log_returns[i] ** 2) + (1 - alpha) * ewma_var
+        ewma_vol[i + 1] = np.sqrt(ewma_var)
+    
+    return ewma_vol
+
+def _compute_roc_thresholds(prices: np.ndarray, window: int = 8) -> tuple[float, float]:
+    """
+    Compute ROC over 8-day window and set thresholds to ±1σ.
+    
+    Args:
+        prices: Daily price series
+        window: ROC window length
+        
+    Returns:
+        (lower_threshold, upper_threshold) as ±1σ of ROC series
+    """
+    if len(prices) < window + 1:
+        return -0.05, 0.05  # Default 5% thresholds
+    
+    # Compute ROC over window
+    roc_series = []
+    for i in range(window, len(prices)):
+        roc = (prices[i] - prices[i - window]) / prices[i - window]
+        roc_series.append(roc)
+    
+    if len(roc_series) == 0:
+        return -0.05, 0.05
+    
+    roc_std = np.std(roc_series, ddof=1)
+    return -roc_std, roc_std
+
+def _risk_adjusted_sharpe(returns: pd.Series, risk_free_rate: float = 0.04) -> float:
+    """
+    Compute risk-adjusted Sharpe ratio.
+    
+    Args:
+        returns: Daily return series
+        risk_free_rate: Annual risk-free rate (default 4%)
+        
+    Returns:
+        Sharpe ratio: (mean_return - risk_free) / std * √252
+    """
+    if len(returns) == 0 or returns.std(ddof=1) == 0:
+        return -np.inf
+    
+    # Convert annual risk-free rate to daily
+    daily_rf = risk_free_rate / 252
+    
+    # Compute excess returns
+    excess_returns = returns - daily_rf
+    
+    # Sharpe ratio with annualization
+    return excess_returns.mean() / returns.std(ddof=1) * np.sqrt(252)
+
+# ---------------------------------------------------------------------------
+# Enhanced Main labeler ------------------------------------------------------
+# ---------------------------------------------------------------------------
+
+class MarketLabelerEWMA:
+    def __init__(self, cfg_path: str = "config.yaml") -> None:
+        self.cfg = _TBLConfig.from_yaml(cfg_path)
+
+    # ------------------------------------------------------------------
+    def label_data(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add enhanced TBL labels with EWMA volatility and financial constraints.
+
+        Parameters
+        ----------
+        data : DataFrame with at least columns ``date`` & ``Close``.
+        """
+        if "date" not in data.columns and "Tweet Date" in data.columns:
+            data = data.rename(columns={"Tweet Date": "date"})
+        df = data.copy().sort_values("date").reset_index(drop=True)
+
+        # Create unique daily price data for labeling logic
+        print("Creating unique daily price series for EWMA-based TBL labeling...")
+        daily_prices = self._create_daily_price_series(df)
+        
+        # Compute EWMA volatility and ROC thresholds
+        print("Computing EWMA volatility and ROC thresholds...")
+        daily_prices = self._add_financial_indicators(daily_prices)
+        
+        # Pre-allocate arrays for all tweets
+        n = len(df)
+        upper = np.empty(n)
+        lower = np.empty(n) 
+        label = np.empty(n, dtype=object)
+        vertical_barrier = np.empty(n)
+        volatility = np.empty(n)
+
+        # Rolling optimization on daily price data
+        daily_step = self.cfg.rebalance_days
+        
+        for daily_start in range(0, len(daily_prices), daily_step):
+            daily_end = min(daily_start + daily_step, len(daily_prices))
+            
+            # Grid-search on the *previous* daily window
+            opt_slice = slice(max(0, daily_start - daily_step), daily_start)
+            if opt_slice.start < opt_slice.stop:
+                fu, fl, vt = self._optimize_params(daily_prices.iloc[opt_slice])
+            else:
+                # First window - use default params
+                fu, fl, vt = self.cfg.fu_grid[0], self.cfg.fl_grid[0], self.cfg.vt_grid[0]
+            
+            # Apply enhanced TBL to all tweets in this daily window
+            daily_window = daily_prices.iloc[daily_start:daily_end]
+            self._apply_enhanced_tbl_to_window(
+                df, daily_window, fu, fl, vt, 
+                upper, lower, label, vertical_barrier, volatility
+            )
+
+        df["Upper Barrier"] = upper
+        df["Lower Barrier"] = lower
+        df["Vertical Barrier"] = vertical_barrier
+        df["Volatility"] = volatility
+        df["Label"] = label
+        
+        return df
+
+    def _create_daily_price_series(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Create a series of unique daily prices for TBL logic."""
+        # Group by date (date only) and take first price of each day
+        df_daily = df.copy()
+        df_daily['date_only'] = df_daily['date'].dt.date
+        
+        daily_prices = df_daily.groupby('date_only').agg({
+            'date': 'first',
+            'Close': 'first'
+        }).reset_index(drop=True)
+        
+        daily_prices = daily_prices.sort_values('date').reset_index(drop=True)
+        print(f"Created daily price series: {len(daily_prices)} unique trading days")
+        
+        return daily_prices
+
+    def _add_financial_indicators(self, daily_prices: pd.DataFrame) -> pd.DataFrame:
+        """Add EWMA volatility and other financial indicators."""
+        prices = daily_prices['Close'].values
+        
+        # Compute 30-day EWMA volatility
+        volatility = _compute_ewma_volatility(prices, tau=30)
+        daily_prices['EWMA_Volatility'] = volatility
+        
+        # Compute ROC thresholds (for future use if needed)
+        roc_lower, roc_upper = _compute_roc_thresholds(prices, window=8)
+        daily_prices['ROC_Lower_Threshold'] = roc_lower
+        daily_prices['ROC_Upper_Threshold'] = roc_upper
+        
+        print(f"EWMA volatility computed. Mean volatility: {np.nanmean(volatility):.4f}")
+        print(f"ROC thresholds: [{roc_lower:.4f}, {roc_upper:.4f}]")
+        
+        return daily_prices
+
+    def _apply_enhanced_tbl_to_window(
+        self,
+        df: pd.DataFrame,
+        daily_window: pd.DataFrame,
+        fu: float,
+        fl: float,
+        vt: int,
+        upper: np.ndarray,
+        lower: np.ndarray,
+        label: np.ndarray,
+        vertical_barrier: np.ndarray,
+        volatility: np.ndarray
+    ):
+        """Apply enhanced TBL with volatility-adjusted barriers and trend constraints."""
+
+        # 1) reset the daily slice so that .iloc is purely positional (0…n-1)
+        window_prices = daily_window.reset_index(drop=True)
+
+        # 2) build a date→position map off of that reset frame
+        date_to_pos = {
+            row["date"].date(): pos
+            for pos, row in window_prices.iterrows()
+        }
+
+        # 3) find which tweets fall into this block of trading days
+        start_date = daily_window["date"].min().date()
+        end_date   = daily_window["date"].max().date()
+        window_mask   = (df["date"].dt.date >= start_date) & (df["date"].dt.date <= end_date)
+        window_tweets = df[window_mask]
+
+        for tweet_idx in window_tweets.index:
+            tweet_date  = df.at[tweet_idx, "date"].date()
+            tweet_price = df.at[tweet_idx, "Close"]
+
+            if tweet_date not in date_to_pos:
+                # edge case: no matching trading‐day row
+                upper[tweet_idx]           = tweet_price * 1.02
+                lower[tweet_idx]           = tweet_price * 0.98
+                vertical_barrier[tweet_idx] = vt
+                volatility[tweet_idx]      = 0.02
+                label[tweet_idx]           = "Neutral"
+                continue
+
+            # positional index into window_prices
+            daily_idx = date_to_pos[tweet_date]
+
+            # pull that day's EWMA volatility
+            ewma_vol = window_prices.loc[daily_idx, "EWMA_Volatility"]
+            if pd.isna(ewma_vol) or ewma_vol <= 0:
+                ewma_vol = 0.02  # safe default
+
+            # compute the vol-adjusted barriers
+            upper[tweet_idx]           = tweet_price + tweet_price * ewma_vol * fu
+            lower[tweet_idx]           = tweet_price - tweet_price * ewma_vol * fl
+            vertical_barrier[tweet_idx] = vt
+            volatility[tweet_idx]      = ewma_vol
+
+            # look at the next vt **trading** days from our reset window_prices
+            future_end    = min(daily_idx + vt, len(window_prices) - 1)
+            future_prices = window_prices["Close"].iloc[daily_idx : future_end + 1].values
+
+            # enforce the 2-day minimum, then do the TBL pick
+            label[tweet_idx] = self._enhanced_tbl_logic(
+                future_prices,
+                upper[tweet_idx],
+                lower[tweet_idx],
+                min_days=2
+            )
+
+
+    def _enhanced_tbl_logic(self, future_prices: np.ndarray, upper_barrier: float, 
+                          lower_barrier: float, min_days: int = 2) -> str:
+        """
+        Enhanced TBL logic with 2-day minimum trend enforcement.
+        
+        Args:
+            future_prices: Price path starting from current day
+            upper_barrier: Upper barrier level
+            lower_barrier: Lower barrier level
+            min_days: Minimum days before allowing barrier hits (default 2)
+            
+        Returns:
+            Label: "Bullish", "Bearish", or "Neutral"
+        """
+        if len(future_prices) < min_days + 1:
+            return "Neutral"
+        
+        # Only consider prices from min_days onwards for barrier hits
+        relevant_prices = future_prices[min_days:]
+        
+        if len(relevant_prices) == 0:
+            return "Neutral"
+        
+        # Check barrier hits
+        hit_upper = np.any(relevant_prices >= upper_barrier)
+        hit_lower = np.any(relevant_prices <= lower_barrier)
+        
+        if hit_upper and hit_lower:
+            # Whichever comes first wins (among valid days)
+            up_idx = np.argmax(relevant_prices >= upper_barrier)
+            lo_idx = np.argmax(relevant_prices <= lower_barrier)
+            return "Bullish" if up_idx < lo_idx else "Bearish"
+        elif hit_upper:
+            return "Bullish"
+        elif hit_lower:
+            return "Bearish"
+        else:
+            return "Neutral"
+
+    # ------------------------------------------------------------------
+    def _optimize_params(self, daily_window: pd.DataFrame) -> tuple[float, float, int]:
+        """Grid‑search Fu, Fl, Vt on daily price data to max risk-adjusted Sharpe."""
+        if len(daily_window) < 3:
+            return self.cfg.fu_grid[0], self.cfg.fl_grid[0], self.cfg.vt_grid[0]
+        
+        # Ensure we have volatility data
+        if 'EWMA_Volatility' not in daily_window.columns:
+            daily_window = self._add_financial_indicators(daily_window)
+            
+        best = (-np.inf, self.cfg.fu_grid[0], self.cfg.fl_grid[0], self.cfg.vt_grid[0])
+        
+        for fu, fl, vt in itertools.product(self.cfg.fu_grid, self.cfg.fl_grid, self.cfg.vt_grid):
+            labels = self._apply_enhanced_tbl_daily(daily_window, fu, fl, vt)
+            rets = self._strategy_returns(daily_window['Close'].values, labels)
+            s = _risk_adjusted_sharpe(pd.Series(rets))
+            if s > best[0]:
+                best = (s, fu, fl, vt)
+        
+        return best[1:]
+
+    # ------------------------------------------------------------------
+    def _apply_enhanced_tbl_daily(self, daily_window: pd.DataFrame, 
+                                fu: float, fl: float, vt: int) -> np.ndarray:
+        """Apply enhanced TBL to daily price series for optimization."""
+        prices = daily_window['Close'].values
+        volatilities = daily_window['EWMA_Volatility'].values
+        n = len(prices)
+        labels = np.empty(n, dtype=object)
+
+        for i in range(n):
+            # Get volatility for this day
+            vol = volatilities[i] if not pd.isna(volatilities[i]) else 0.02
+            
+            # Compute volatility-adjusted barriers
+            upper_barrier = prices[i] + prices[i] * vol * fu
+            lower_barrier = prices[i] - prices[i] * vol * fl
+            
+            # Future price path
+            future_end = min(i + vt, n - 1)
+            future_prices = prices[i:future_end + 1]
+            
+            # Apply enhanced logic
+            labels[i] = self._enhanced_tbl_logic(future_prices, upper_barrier, lower_barrier, min_days=2)
+        
+        return labels
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _strategy_returns(prices: np.ndarray, labels: np.ndarray) -> np.ndarray:
+        """Generate daily returns for risk-adjusted Sharpe optimization."""
+        if len(prices) < 2:
+            return np.array([])
+        pos = np.where(labels == "Bullish", +1, np.where(labels == "Bearish", -1, 0))
+        pct = np.diff(prices) / prices[:-1]
+        return pos[:-1] * pct
+
+
+# Test function to validate the enhanced labeler
+def test_enhanced_labeler():
+    """Test the enhanced labeler with EWMA volatility."""
+    print("="*60)
+    print("TESTING ENHANCED MARKET LABELER WITH EWMA")
+    print("="*60)
+    
+    # Load sample data
+    df = pd.read_csv("data/combined_dataset_raw.csv")
+    df['date'] = pd.to_datetime(df['date'], format='mixed', errors='coerce')
+    df = df.dropna(subset=['date'])
+    df = df[df['Close'].notna()]
+    
+    # Take a sample for testing
+    start_date = '2020-01-01'
+    end_date = '2020-01-31'
+    df_sample = df[(df['date'] >= start_date) & (df['date'] <= end_date)].copy()
+    
+    print(f"Test sample: {len(df_sample)} tweets from {start_date} to {end_date}")
+    print(f"Unique dates: {df_sample['date'].dt.date.nunique()}")
+    
+    # Test enhanced labeler
+    labeler = MarketLabelerEWMA("config.yaml")
+    result = labeler.label_data(df_sample)
+    
+    print("\nEnhanced labeling results:")
+    label_counts = result['Label'].value_counts()
+    print(label_counts)
+    print(f"Percentages: {(label_counts / len(result) * 100).round(2)}")
+    
+    print(f"\nVolatility statistics:")
+    print(f"Mean volatility: {result['Volatility'].mean():.4f}")
+    print(f"Volatility range: [{result['Volatility'].min():.4f}, {result['Volatility'].max():.4f}]")
+    
+    # Show sample results
+    print("\nSample results with volatility-adjusted barriers:")
+    sample_cols = ['date', 'Close', 'Volatility', 'Upper Barrier', 'Lower Barrier', 'Label']
+    print(result[sample_cols].head(10))
+
+
+if __name__ == "__main__":
+    test_enhanced_labeler() 
