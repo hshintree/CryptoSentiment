@@ -184,15 +184,18 @@ class MarketLabelerEWMA:
         for daily_start in range(0, len(daily_prices), daily_step):
             daily_end = min(daily_start + daily_step, len(daily_prices))
             
-            # Grid-search on the *previous* daily window
+            # Grid-search on the *previous* daily window for optimization
             opt_slice = slice(max(0, daily_start - daily_step), daily_start)
             if opt_slice.start < opt_slice.stop:
+                # Use optimized parameters from past data
                 fu, fl, vt = self._optimize_params(daily_prices.iloc[opt_slice])
+                print(f"  Window {daily_start}-{daily_end}: Optimized params fu={fu:.2f}, fl={fl:.2f}, vt={vt}")
             else:
-                # First window - use default params
+                # Cold start - use first grid values only for very first window
                 fu, fl, vt = self.cfg.fu_grid[0], self.cfg.fl_grid[0], self.cfg.vt_grid[0]
+                print(f"  Window {daily_start}-{daily_end}: Cold start params fu={fu:.2f}, fl={fl:.2f}, vt={vt}")
             
-            # Apply enhanced TBL to all tweets in this daily window
+            # Apply optimized TBL to all tweets in this daily window
             daily_window = daily_prices.iloc[daily_start:daily_end]
             self._apply_enhanced_tbl_to_window(
                 df, daily_window, fu, fl, vt, 
@@ -309,7 +312,7 @@ class MarketLabelerEWMA:
         daily_prices["ROC_Lower"] = roc_lowers  
         daily_prices["ROC_Upper"] = roc_uppers
         
-        # Apply TBL logic with per-timestep parameters
+        # Apply TBL logic with rolling optimization
         n = len(df)
         upper = np.empty(n)
         lower = np.empty(n) 
@@ -317,14 +320,29 @@ class MarketLabelerEWMA:
         vertical_barrier = np.empty(n)
         volatility = np.empty(n)
         
-        # Use default parameters for simplicity in fold-wise training
-        fu, fl, vt = self.cfg.fu_grid[0], self.cfg.fl_grid[0], self.cfg.vt_grid[0]
+        # Rolling optimization on daily price data
+        daily_step = self.cfg.rebalance_days
         
-        # Apply TBL to all tweets
-        self._apply_enhanced_tbl_to_window(
-            df, daily_prices, fu, fl, vt, 
-            upper, lower, label, vertical_barrier, volatility
-        )
+        for daily_start in range(0, len(daily_prices), daily_step):
+            daily_end = min(daily_start + daily_step, len(daily_prices))
+            
+            # Grid-search on the *previous* daily window for optimization
+            opt_slice = slice(max(0, daily_start - daily_step), daily_start)
+            if opt_slice.start < opt_slice.stop:
+                # Use optimized parameters from past data
+                fu, fl, vt = self._optimize_params(daily_prices.iloc[opt_slice])
+                print(f"  Window {daily_start}-{daily_end}: Optimized params fu={fu:.2f}, fl={fl:.2f}, vt={vt}")
+            else:
+                # Cold start - use first grid values only for very first window
+                fu, fl, vt = self.cfg.fu_grid[0], self.cfg.fl_grid[0], self.cfg.vt_grid[0]
+                print(f"  Window {daily_start}-{daily_end}: Cold start params fu={fu:.2f}, fl={fl:.2f}, vt={vt}")
+            
+            # Apply optimized TBL to all tweets in this daily window
+            daily_window = daily_prices.iloc[daily_start:daily_end]
+            self._apply_enhanced_tbl_to_window(
+                df, daily_window, fu, fl, vt, 
+                upper, lower, label, vertical_barrier, volatility
+            )
         
         df["Upper Barrier"] = upper
         df["Lower Barrier"] = lower

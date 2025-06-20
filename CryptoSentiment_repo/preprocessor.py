@@ -2,7 +2,7 @@ import re
 import pandas as pd
 import numpy as np
 import yaml
-from typing import Dict
+from typing import Dict, Optional
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from nltk.stem import WordNetLemmatizer
 import emoji
@@ -19,6 +19,9 @@ class Preprocessor:
         if self.settings.get('lemmatization', False):
             self.lemmatizer = WordNetLemmatizer()
 
+        # prepare an (un-fitted) scaler for RSI/ROC
+        self.scaler: Optional[MinMaxScaler] = None
+
     def _process_volume(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Process volume data to compute both z-score and log-volume.
@@ -32,8 +35,8 @@ class Preprocessor:
         
         return df
 
-    def preprocess(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Preprocess the data according to the specified steps."""
+    def _compute_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Text cleaning, RSI, ROC, volume, fill-na—but no scaling."""
         # Make a copy to avoid modifying the original
         data = data.copy()
         
@@ -77,13 +80,43 @@ class Preprocessor:
         ## 3) Process volume data
         data = self._process_volume(data)
 
-        ## 4) Fill missing, scale RSI/ROC
+        ## 4) Fill missing values
         # Use forward fill first, then backward fill for any remaining NaNs
         data = data.ffill().bfill()
         
-        # Scale RSI/ROC if they exist
+        return data
+
+    def preprocess(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Legacy method for backward compatibility.
+        WARNING: This applies global scaling and should not be used in fold-wise training!
+        Use fit() and transform() instead for proper cross-validation.
+        """
+        data = self._compute_indicators(data)
+        
+        # ⚠️ GLOBAL SCALING - causes data leakage in cross-validation!
         if {'RSI','ROC'}.issubset(data.columns):
             scaler = MinMaxScaler()
             data[['RSI','ROC']] = scaler.fit_transform(data[['RSI','ROC']])
-
+            
         return data
+
+    def fit(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Fit the RSI/ROC scaler on df, return scaled df."""
+        data = self._compute_indicators(df)
+        if {'RSI','ROC'}.issubset(data.columns):
+            self.scaler = MinMaxScaler().fit(data[['RSI','ROC']])
+            data[['RSI','ROC']] = self.scaler.transform(data[['RSI','ROC']])
+        return data
+
+    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Apply previously‐fitted scaler to df."""
+        if self.scaler is None:
+            raise RuntimeError("Must call fit() before transform()")
+        data = self._compute_indicators(df)
+        data[['RSI','ROC']] = self.scaler.transform(data[['RSI','ROC']])
+        return data
+
+    def fit_transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Convenience: fit() then transform()."""
+        return self.fit(df)
