@@ -4,6 +4,7 @@
 • Pure text prompts for all features (no numeric_features)
 """
 
+import os
 import yaml
 import torch
 import torch.nn as nn
@@ -29,28 +30,44 @@ class Model:
         else:
             raise ValueError("Unsupported model type – choose CryptoBERT or FinBERT")
 
+        # enable MPS fallback and pick the right device
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        self.device = torch.device(
+            "mps" if torch.backends.mps.is_available()
+            else "cuda" if torch.cuda.is_available()
+            else "cpu"
+        )
+        # load tokenizer + model, then move model to device
         self.tokenizer  = AutoTokenizer.from_pretrained(ckpt)
         self.bert_model = AutoModelForSequenceClassification.from_pretrained(
             ckpt, num_labels=3
-        )
+        ).to(self.device)
+        
+        # Eagerly allocate embedding storage on MPS device
+        self.bert_model.get_input_embeddings().to(self.device)
         
         # Initialize prompt embeddings for prompt-tuning
         if self.use_prompt_tuning:
             hidden_size = self.bert_model.config.hidden_size
+            # create prompt embeddings and eagerly move to device for MPS
             self.prompt_embeddings = nn.Parameter(
-                torch.randn(self.prompt_length, hidden_size) * 0.02
+                torch.randn(self.prompt_length, hidden_size, device=self.device) * 0.02
             )
             
-            # Freeze ALL BERT parameters
+            # Freeze ALL BERT parameters...
             for param in self.bert_model.parameters():
                 param.requires_grad = False
+
+            # ...except the *last* transformer block (per paper)
+            for param in self.bert_model.base_model.encoder.layer[-1].parameters():
+                param.requires_grad = True
                 
-            # Unfreeze only the classifier head
+            # Unfreeze the classifier head
             for param in self.bert_model.classifier.parameters():
                 param.requires_grad = True
                 
             print(f"Initialized prompt-tuning with {self.prompt_length} prompt tokens")
-            print("Frozen all BERT layers - only training prompt embeddings + classifier")
+            print("Frozen first 11 BERT layers - training prompt embeddings + last layer + classifier")
 
     def preprocess_input(
         self,
@@ -76,25 +93,20 @@ class Model:
             f"ROC:{roc:.4f} | RSI:{rsi:.2f}{volume_info} | Tweet:{tweet_content}"
         )
         
-        # Determine safe length
-        max_pos = self.bert_model.config.max_position_embeddings
-        max_len = min(128, max_pos)  # Reduced from 256 to 128 to be safe
-
-        # Get tokenizer output - only the text prompt
+        # Tokenize prompt and let HF handle positions & truncation at 128
         tokenized = self.tokenizer(
             prompt,
             padding="max_length",
             truncation=True,
-            max_length=max_len,
+            max_length=128,
             return_tensors="pt",
         )
-        
-        # No need for manual position_ids - BERT's embedding layer handles this
-        # No numeric_features tensor - everything is in the text prompt
         return tokenized
 
     def forward(self, inputs):
         """Forward pass with prompt embeddings prepended to input."""
+        # ensure all incoming tensors live on our target device
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
         # shortcut to standard fine-tuning
         if not self.use_prompt_tuning:
             return self.bert_model(**inputs).logits
@@ -122,18 +134,21 @@ class Model:
         else:
             combined_mask = None
 
-        # 4) hand it all back to HF — it runs embed→encoder→pooler→classifier
-        batch_size = combined_embeds.size(0)
-        token_type_ids = torch.zeros(
-            batch_size,
-            combined_embeds.size(1),
-            dtype=torch.long,
-            device=combined_embeds.device
-        )
+        # 4) truncate to model max positions and build explicit position ids
+        batch_size, seq_len, _ = combined_embeds.size()
+        max_pos = self.bert_model.config.max_position_embeddings
+        if seq_len > max_pos:
+            combined_embeds = combined_embeds[:, :max_pos, :]
+            combined_mask   = combined_mask[:, :max_pos] if combined_mask is not None else None
+            seq_len = max_pos
+
+        # Create fresh position_ids to avoid HF's internal buffered_token_type_ids mismatches
+        position_ids = torch.arange(seq_len, dtype=torch.long, device=combined_embeds.device).unsqueeze(0).expand(batch_size, -1)
+
         out = self.bert_model(
             inputs_embeds=combined_embeds,
             attention_mask=combined_mask,
-            token_type_ids=token_type_ids,
+            position_ids=position_ids,
         )
         return out.logits
 

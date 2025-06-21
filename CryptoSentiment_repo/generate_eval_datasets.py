@@ -4,7 +4,7 @@ Standalone script to generate, validate, and save evaluation datasets.
 
 This script:
 1. Uses the enhanced EWMA market labeler
-2. Creates Ea and Eb datasets exactly as specified in the paper
+2. Creates Ea (2019-2020), Val (2021), and Eb (2015-2018 & 2022-2023) datasets
 3. Validates all characteristics and paper compliance
 4. Saves datasets as CSV files in data/ directory
 5. Provides comprehensive reporting and validation
@@ -52,6 +52,7 @@ def validate_dataset_characteristics(datasets, verbose=True):
         print("="*80)
     
     ea_df = datasets['ea_full']
+    val_df = datasets['val_full']
     eb_df = datasets['eb_full']
     all_data = datasets['all_data']
     
@@ -70,13 +71,15 @@ def validate_dataset_characteristics(datasets, verbose=True):
         print(f"{status} Size: {ea_size:,} tweets (target: ~60,000)")
     
     # Year validation
-    ea_years = ea_df['date'].dt.year.unique()
-    ea_year_ok = len(ea_years) == 1 and ea_years[0] == 2020
-    validation_results["ea_validation"]["year"] = {"value": list(ea_years), "ok": ea_year_ok, "target": "[2020]"}
+    ea_years = sorted(ea_df['date'].dt.year.unique())
+    ea_year_ok = ea_years == [2019, 2020]
+    validation_results["ea_validation"]["year"] = {
+        "value": ea_years, "ok": ea_year_ok, "target": "[2019, 2020]"
+    }
     
     if verbose:
         status = "✅" if ea_year_ok else "❌"
-        print(f"{status} Year coverage: {list(ea_years)} (target: [2020])")
+        print(f"{status} Year coverage: {ea_years} (target: [2019, 2020])")
     
     # Label distribution validation
     ea_labels = ea_df['Label'].value_counts()
@@ -105,6 +108,43 @@ def validate_dataset_characteristics(datasets, verbose=True):
         if ea_has_volatility:
             print(f"   Mean volatility: {ea_df['Volatility'].mean():.4f}")
     
+    # ===== VAL DATASET VALIDATION =====
+    if verbose:
+        print("\n📋 VAL DATASET (2021 STRESS-TEST) VALIDATION:")
+        print("-" * 50)
+    
+    # Size validation
+    val_size = len(val_df)
+    val_size_ok = 15000 <= val_size <= 500000  # Flexible range for full year
+    validation_results["val_validation"] = {}
+    validation_results["val_validation"]["size"] = {"value": val_size, "ok": val_size_ok, "target": "150k-500k"}
+    
+    if verbose:
+        status = "✅" if val_size_ok else "❌"
+        print(f"{status} Size: {val_size:,} tweets (target: full 2021 year)")
+    
+    # Year validation
+    val_years = sorted(val_df['date'].dt.year.unique())
+    val_year_ok = val_years == [2021]
+    validation_results["val_validation"]["year"] = {
+        "value": val_years, "ok": val_year_ok, "target": "[2021]"
+    }
+    
+    if verbose:
+        status = "✅" if val_year_ok else "❌"
+        print(f"{status} Year coverage: {val_years} (target: [2021])")
+    
+    # Label distribution (no hard balance check - just display)
+    val_labels = val_df['Label'].value_counts()
+    validation_results["val_validation"]["distribution"] = {
+        "value": val_labels.to_dict(),
+        "ok": True,  # Always pass - just informational
+        "target": "Display only"
+    }
+    
+    if verbose:
+        print(f"✅ Label distribution: {val_labels.to_dict()}")
+    
     # ===== EB DATASET VALIDATION =====
     if verbose:
         print("\n📋 EB DATASET (EVENT EVALUATION) VALIDATION:")
@@ -119,14 +159,16 @@ def validate_dataset_characteristics(datasets, verbose=True):
         status = "✅" if eb_size_ok else "❌"
         print(f"{status} Size: {eb_size:,} tweets (target: ~40,000)")
     
-    # Year validation (excluding 2020)
+    # Year validation (excluding 2019-2021)
     eb_years = sorted(eb_df['date'].dt.year.unique())
-    eb_year_ok = 2020 not in eb_years and len(eb_years) > 1
-    validation_results["eb_validation"]["years"] = {"value": eb_years, "ok": eb_year_ok, "target": "2015-2019, 2021-2023"}
+    eb_year_ok = (2019 not in eb_years) and (2020 not in eb_years) and (2021 not in eb_years) and len(eb_years) > 1
+    validation_results["eb_validation"]["years"] = {
+        "value": eb_years, "ok": eb_year_ok, "target": "2015-2018, 2022-2023"
+    }
     
     if verbose:
         status = "✅" if eb_year_ok else "❌"
-        print(f"{status} Year coverage: {eb_years} (target: excludes 2020)")
+        print(f"{status} Year coverage: {eb_years} (target: excludes 2019-2021)")
     
     # Event focus validation
     eb_events = eb_df['Is_Event'].sum()
@@ -201,6 +243,7 @@ def validate_dataset_characteristics(datasets, verbose=True):
     # ===== OVERALL VALIDATION =====
     all_checks = [
         ea_size_ok, ea_year_ok, ea_balance_ok, ea_vol_ok,
+        val_size_ok, val_year_ok,
         eb_size_ok, eb_year_ok, eb_event_ok, eb_actionable_ok,
         cv_ok, agg_size_ok
     ]
@@ -241,8 +284,9 @@ def save_datasets_to_csv(datasets, data_dir, timestamp=None):
     
     # Main datasets
     files_to_save = [
-        ("ea_full", f"ea_dataset_2020_training_{timestamp}.csv", "Ea training dataset (2020)"),
-        ("eb_full", f"eb_dataset_event_evaluation_{timestamp}.csv", "Eb evaluation dataset (events)"),
+        ("ea_full", f"ea_dataset_2019-2020_train_{timestamp}.csv", "Ea training dataset (2019-2020)"),
+        ("val_full", f"val_dataset_2021_stress_{timestamp}.csv", "2021 stress-test dataset"),
+        ("eb_full", f"eb_event_15-18_22-23_{timestamp}.csv", "Eb evaluation dataset (events)"),
         ("all_data", f"aggregated_daily_dataset_{timestamp}.csv", "Daily aggregated dataset")
     ]
     
@@ -315,7 +359,8 @@ def generate_summary_report(datasets, validation_results, saved_files, timestamp
     # Dataset overview
     report_lines.append("📋 DATASET OVERVIEW:")
     report_lines.append("-" * 40)
-    report_lines.append(f"Ea dataset (2020 training): {len(datasets['ea_full']):,} tweets")
+    report_lines.append(f"Ea dataset (2019-2020 training): {len(datasets['ea_full']):,} tweets")
+    report_lines.append(f"Val dataset (2021 stress-test): {len(datasets['val_full']):,} tweets")
     report_lines.append(f"Eb dataset (event evaluation): {len(datasets['eb_full']):,} tweets")
     report_lines.append(f"Daily aggregated dataset: {len(datasets['all_data']):,} days")
     report_lines.append(f"Cross-validation folds: 5 folds per dataset")
@@ -325,11 +370,17 @@ def generate_summary_report(datasets, validation_results, saved_files, timestamp
     report_lines.append("📊 LABEL DISTRIBUTIONS:")
     report_lines.append("-" * 40)
     ea_labels = datasets['ea_full']['Label'].value_counts()
+    val_labels = datasets['val_full']['Label'].value_counts()
     eb_labels = datasets['eb_full']['Label'].value_counts()
     
-    report_lines.append("Ea dataset (2020 training):")
+    report_lines.append("Ea dataset (2019-2020 training):")
     for label, count in ea_labels.items():
         pct = (count / len(datasets['ea_full']) * 100)
+        report_lines.append(f"  {label}: {count:,} tweets ({pct:.1f}%)")
+    
+    report_lines.append("Val dataset (2021 stress-test):")
+    for label, count in val_labels.items():
+        pct = (count / len(datasets['val_full']) * 100)
         report_lines.append(f"  {label}: {count:,} tweets ({pct:.1f}%)")
     
     report_lines.append("Eb dataset (event evaluation):")
@@ -363,7 +414,7 @@ def generate_summary_report(datasets, validation_results, saved_files, timestamp
     # Key files
     report_lines.append("🔑 KEY FILES:")
     report_lines.append("-" * 40)
-    key_files = ["ea_full", "eb_full", "all_data", "index"]
+    key_files = ["ea_full", "val_full", "eb_full", "all_data", "index"]
     for key in key_files:
         if key in saved_files:
             report_lines.append(f"  {key}: {saved_files[key]}")
@@ -395,7 +446,7 @@ def main():
     try:
         # 1. Generate datasets
         print("📊 Generating evaluation datasets with enhanced EWMA labeling...")
-        loader = EvalLoaderComplete(csv_path, config_path="config_ewma.yaml")
+        loader = EvalLoaderComplete(csv_path, config_path="config.yaml")
         datasets = loader.create_eval_datasets(n_folds=5)
         
         # 2. Validate characteristics
@@ -424,7 +475,8 @@ def main():
         print("="*60)
         print("To use these datasets in your research:")
         print(f"1. Training data (Ea): {saved_files.get('ea_full', 'N/A')}")
-        print(f"2. Evaluation data (Eb): {saved_files.get('eb_full', 'N/A')}")
+        print(f"2. Validation data (Val): {saved_files.get('val_full', 'N/A')}")
+        print(f"3. Evaluation data (Eb): {saved_files.get('eb_full', 'N/A')}")
         print(f"3. Daily aggregated: {saved_files.get('all_data', 'N/A')}")
         print(f"4. Dataset index: {saved_files.get('index', 'N/A')}")
         print("\nFor cross-validation, use the individual fold files:")

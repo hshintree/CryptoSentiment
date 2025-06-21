@@ -142,7 +142,7 @@ def _risk_adjusted_sharpe(returns: pd.Series, risk_free_rate: float = 0.04) -> f
 # Enhanced Main labeler ------------------------------------------------------
 # ---------------------------------------------------------------------------
 
-class MarketLabelerEWMA:
+class MarketLabelerTBL:
     def __init__(self, cfg_path: str = "config.yaml") -> None:
         self.cfg = _TBLConfig.from_yaml(cfg_path)
         # Store fitted thresholds to prevent leakage
@@ -581,3 +581,52 @@ class MarketLabelerEWMA:
 
 # if __name__ == "__main__":
 #     test_enhanced_labeler() 
+
+
+class MarketFeatureGenerator:
+    """
+    Causal feature generator: fits on training prices only,
+    then for any df returns the per-timestep 'Previous Label'
+    using only past data.
+    """
+    def __init__(self, cfg_path: str = "config.yaml"):
+        self.tbl = MarketLabelerTBL(cfg_path)
+
+    def fit(self, train_df: pd.DataFrame) -> None:
+        """Fit thresholds on training price history."""
+        self.tbl._fit_thresholds(train_df)
+
+    def transform(self, df: pd.DataFrame) -> pd.Series:
+        """Apply per-timestep labeling (no future leak) and return causal Previous Label."""
+        # ── 1. Label every tweet with current regime (already no-leak) ──
+        labeled   = self.tbl._apply_labels_with_fitted_thresholds(df.copy())
+
+        # choose a proper date column
+        date_col  = "date" if "date" in labeled.columns else "Tweet Date"
+        labeled["__day"] = pd.to_datetime(labeled[date_col]).dt.normalize()
+
+        # ── 2. Collapse to one label per trading day ─────────────────────
+        daily_lbl = (
+            labeled.groupby("__day")["Label"].first()   # one label per day
+        )
+
+        # ── 3. Build "previous-regime": majority label over the *last Vₜ* days
+        vt   = self.tbl.cfg.vt_grid[0]               # use same Vₜ as labeler
+        code = {"Bearish": 0, "Neutral": 1, "Bullish": 2}
+        inv  = {v: k for k, v in code.items()}
+
+        # numeric codes → rolling majority (fast) → back to strings
+        prev_regime = (
+            daily_lbl.map(code)                                # string → int
+                     .rolling(window=vt, min_periods=1)
+                     .apply(lambda x: np.bincount(x.astype(int)).argmax(),
+                            raw=True)
+                     .shift(1)                                  # strictly causal
+                     .fillna(code["Neutral"]).astype(int)
+                     .map(inv)                                  # int → string
+        )
+
+        # map back to each tweet on that day
+        labeled["PrevRegime"] = labeled["__day"].map(prev_regime)
+
+        return labeled["PrevRegime"]

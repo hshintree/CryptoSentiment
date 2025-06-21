@@ -27,8 +27,8 @@ data:
 model:
   type: "CryptoBERT"           # CryptoBERT ≡ BERTweet maybe FinBERT
   pretrained_name: "vinai/bertweet-base"
-  freeze_layers: 11            # freeze first 11 transformer blocks
-  prompt_tuning: true
+  prompt_tuning: true          # Use prompt-tuning instead of fine-tuning
+  prompt_length: 10            # Number of learnable prompt tokens
 backtesting:
   using_library: "vectorbt"
 evaluation:
@@ -46,7 +46,18 @@ market_labeling:
   barrier_window: 8-15  # Specified in paper
   upper_vol_mult: 1.0  # Volatility multiplier for upper barrier
   lower_vol_mult: 1.0  # Volatility multiplier for lower barrier
-  fu_grid: [0.03, 0.05, 0.07]
-  fl_grid: [0.03, 0.05, 0.07]
-  vt_grid: [5, 10]
+  # ─── CONSERVATIVE BARRIERS (more Neutral) ──────────────
+  # • 1.4–2.2 × σ ≈ 12–20 % BTC move when σ30 ≈ 9–10 %
+  # • Keeps the same 8–12 day look-ahead the paper proved profitable
+  fu_grid: [1.4, 1.6, 1.8, 2.2]     # Upper barrier multipliers
+  fl_grid: [1.4, 1.6, 1.8, 2.2]     # Lower barrier multipliers
+  vt_grid: [8, 10, 12]              # Days to give the move time
+
+  # Leave EWMA look-back at 30 days so σ remains comparable
+  ewma_tau: 30
+
+  # Minimum bars in time before a hit counts (unchanged)
+  min_trend_days: 2
+
+  # Re-optimise every ~6 months (126 trading days)
   rebalance_days: 126

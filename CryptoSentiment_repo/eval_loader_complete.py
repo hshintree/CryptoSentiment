@@ -13,22 +13,22 @@ This is the final, production-ready version that implements all requirements:
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import TimeSeriesSplit
-from market_labeler_ewma import MarketLabelerEWMA
+from market_labeler_ewma import MarketLabelerTBL
 from pathlib import Path
 
 
 class EvalLoaderComplete:
-    def __init__(self, csv_path, config_path="config_ewma.yaml"):
+    def __init__(self, csv_path, config_path="config.yaml"):
         """
         Initialize Complete EvalLoader with enhanced EWMA market labeling.
         
         Args:
             csv_path: Path to combined_dataset_raw.csv
-            config_path: Path to config_ewma.yaml for enhanced labeler
+            config_path: Path to config.yaml for enhanced labeler
         """
         self.csv_path = csv_path
         self.config_path = config_path
-        self.labeler = MarketLabelerEWMA(config_path)
+        self.labeler = MarketLabelerTBL(config_path)
         
         # Load and clean the dataset
         print(f"Loading dataset from: {csv_path}")
@@ -88,15 +88,24 @@ class EvalLoaderComplete:
         print(f"Mean EWMA volatility: {df_labeled['Volatility'].mean():.4f}")
         print(f"Volatility range: [{df_labeled['Volatility'].min():.4f}, {df_labeled['Volatility'].max():.4f}]")
         
-        # 2. Create Ea dataset (2020, ~60k tweets evenly distributed)
+        # 2. Create Ea dataset (2019-2020, ~90k tweets evenly distributed)
         print("\n" + "="*50)
-        print("CREATING EA DATASET (2020 FINE-TUNING)")
+        print("CREATING EA DATASET (2019-2020 FINE-TUNING)")
         print("="*50)
         ea_df = self._create_ea_dataset(df_labeled)
         print(f"✅ Ea dataset: {len(ea_df)} tweets")
         print(f"✅ Ea label distribution: {ea_df['Label'].value_counts().to_dict()}")
         
-        # 3. Create Eb dataset (2015-2019 & 2021-2023, ~40k tweets event-focused)
+        # 3. Create Val dataset (2021 stress-test)
+        print("\n" + "="*50)
+        print("CREATING VAL DATASET (2021 STRESS-TEST)")
+        print("="*50)
+        val_df = df_labeled[df_labeled['date'].dt.year == 2021].copy()
+        val_df = self._add_previous_day_label(val_df)
+        print(f"✅ Val dataset: {len(val_df)} tweets")
+        print(f"✅ Val label distribution: {val_df['Label'].value_counts().to_dict()}")
+        
+        # 4. Create Eb dataset (2015-2018 & 2022-2023, ~40k tweets event-focused)
         print("\n" + "="*50)
         print("CREATING EB DATASET (EVENT EVALUATION)")
         print("="*50)
@@ -105,27 +114,29 @@ class EvalLoaderComplete:
         print(f"✅ Eb label distribution: {eb_df['Label'].value_counts().to_dict()}")
         print(f"✅ Eb event distribution: {eb_df['Is_Event'].value_counts().to_dict()}")
         
-        # 4. Time-series splits (grouped by temporal proximity)
+        # 5. Time-series splits (grouped by temporal proximity)
         print("\n" + "="*50)
         print("CREATING GROUPED TIME-SERIES SPLITS")
         print("="*50)
         ea_train_folds, ea_test_folds = self._create_time_folds(ea_df, n_folds)
         eb_train_folds, eb_test_folds = self._create_time_folds(eb_df, n_folds)
+        # Val dataset is kept whole for stress testing (no folds)
         
         print(f"✅ Ea fold sizes - train: {[len(f) for f in ea_train_folds]}")
         print(f"✅ Ea fold sizes - test: {[len(f) for f in ea_test_folds]}")
         print(f"✅ Eb fold sizes - train: {[len(f) for f in eb_train_folds]}")
         print(f"✅ Eb fold sizes - test: {[len(f) for f in eb_test_folds]}")
+        print(f"✅ Val dataset: {len(val_df)} tweets (no folds - full stress test)")
         
-        # 5. Daily aggregation for final model training
+        # 6. Daily aggregation for final model training
         print("\n" + "="*50)
         print("CREATING DAILY AGGREGATED DATASET")
         print("="*50)
-        all_data = self._aggregate_all_data([ea_df, eb_df])
+        all_data = self._aggregate_all_data([ea_df, val_df, eb_df])
         print(f"✅ All data (daily aggregated): {len(all_data)} days")
         
-        # 6. Final validation and paper compliance check
-        self._validate_paper_compliance(ea_df, eb_df, all_data)
+        # 7. Final validation and paper compliance check
+        self._validate_paper_compliance(ea_df, val_df, eb_df, all_data)
         
         return {
             "ea_train_folds": ea_train_folds,
@@ -133,18 +144,19 @@ class EvalLoaderComplete:
             "eb_train_folds": eb_train_folds,
             "eb_test_folds":  eb_test_folds,
             "ea_full":        ea_df,
+            "val_full":       val_df,
             "eb_full":        eb_df,
             "all_data":       all_data
         }
 
     def _create_ea_dataset(self, df_labeled):
         """
-        Create Ea dataset: 2020 data with ~60k tweets evenly distributed across labels.
-        Target: 20k each of Bullish/Bearish/Neutral (or proportional if insufficient).
+        Create Ea dataset: 2019-2020 data with ~90k tweets evenly distributed across labels.
+        Target: ~30k each of Bullish/Bearish/Neutral (or proportional if insufficient).
         """
-        # Filter for 2020
-        ea = df_labeled[df_labeled['date'].dt.year == 2020].copy()
-        print(f"2020 data available: {len(ea)} tweets")
+        # Filter for 2019-2020
+        ea = df_labeled[df_labeled['date'].dt.year.isin([2019, 2020])].copy()
+        print(f"2019-2020 data available: {len(ea)} tweets")
         
         # Drop rows with missing labels
         ea = ea[ea['Label'].isin(['Bullish', 'Bearish', 'Neutral'])]
@@ -152,10 +164,10 @@ class EvalLoaderComplete:
         
         # Check available counts
         label_counts = ea['Label'].value_counts()
-        print(f"Available labels in 2020: {label_counts.to_dict()}")
+        print(f"Available labels in 2019-2020: {label_counts.to_dict()}")
         
         # Determine sampling strategy based on availability
-        total_target = 60000
+        total_target = 90_000    # ≈30k per class
         min_available = label_counts.min()
         
         if min_available * 3 >= total_target:
@@ -164,7 +176,7 @@ class EvalLoaderComplete:
             print(f"Perfect balance achievable: {target_per_class} per class")
         else:
             # Take all of minority class and balance others
-            target_per_class = min(min_available, 20000)
+            target_per_class = min(min_available, 30000)  # ~30k per class for 90k total
             print(f"Limited by minority class: {target_per_class} per class")
         
         # Sample each class
@@ -190,22 +202,22 @@ class EvalLoaderComplete:
         ea_sampled = pd.concat(sampled_dfs, ignore_index=True)
         ea_sampled = ea_sampled.sort_values('date').reset_index(drop=True)
         
-        # Add Previous_Label
+        # Add Previous Label
         ea_sampled = self._add_previous_day_label(ea_sampled)
         
         return ea_sampled
 
     def _create_eb_dataset(self, df_labeled):
         """
-        Create Eb dataset: 2015-2019 & 2021-2023 data, event-focused.
+        Create Eb dataset: 2015-2018 & 2022-2023 data, event-focused.
         Target: up to 25k event tweets + fill to ~40k with non-event tweets.
         """
-        # Filter for 2015-2019 & 2021-2023 (excluding 2020)
+        # Filter for 2015-2018 & 2022-2023 (exclude Ea years 2019-2020 and Val year 2021)
         eb = df_labeled[
-            ((df_labeled['date'].dt.year >= 2015) & (df_labeled['date'].dt.year <= 2019)) |
-            ((df_labeled['date'].dt.year >= 2021) & (df_labeled['date'].dt.year <= 2023))
+            ((df_labeled['date'].dt.year >= 2015) & (df_labeled['date'].dt.year <= 2018)) |
+            ((df_labeled['date'].dt.year >= 2022) & (df_labeled['date'].dt.year <= 2023))
         ].copy()
-        print(f"2015-2019 & 2021-2023 data available: {len(eb)} tweets")
+        print(f"2015-2018 & 2022-2023 data available: {len(eb)} tweets")
         
         # Ensure Is_Event is numeric
         eb['Is_Event'] = pd.to_numeric(eb['Is_Event'], errors='coerce').fillna(0)
@@ -245,7 +257,7 @@ class EvalLoaderComplete:
         eb_sampled = pd.concat([event_sample, non_event_sample], ignore_index=True)
         eb_sampled = eb_sampled.sort_values('date').reset_index(drop=True)
         
-        # Add Previous_Label
+        # Add Previous Label
         eb_sampled = self._add_previous_day_label(eb_sampled)
         
         return eb_sampled
@@ -266,9 +278,9 @@ class EvalLoaderComplete:
         return train_folds, test_folds
 
     def _add_previous_day_label(self, df):
-        """Add Previous_Label column with the previous day's label."""
+        """Add Previous Label column with the previous day's label (causal)."""
         df_with_prev = df.sort_values('date').reset_index(drop=True)
-        df_with_prev['Previous_Label'] = df_with_prev['Label'].shift(1).fillna('Neutral')
+        df_with_prev['Previous Label'] = df_with_prev['Label'].shift(1).fillna('Neutral')
         return df_with_prev
 
     def _aggregate_all_data(self, dfs):
@@ -278,7 +290,7 @@ class EvalLoaderComplete:
         - mean for numeric features  
         - concatenate tweets with [SEP]
         - max for Is_Event
-        - add Previous_Label
+        - add Previous Label
         """
         # Concatenate all datasets
         all_df = pd.concat(dfs, ignore_index=True)
@@ -318,13 +330,13 @@ class EvalLoaderComplete:
         grouped['date'] = pd.to_datetime(grouped['date_only'])
         grouped = grouped.drop(columns=['date_only'])
         
-        # Sort by date and add Previous_Label
+        # Sort by date and add Previous Label
         grouped = grouped.sort_values('date').reset_index(drop=True)
         grouped = self._add_previous_day_label(grouped)
         
         return grouped
 
-    def _validate_paper_compliance(self, ea_df, eb_df, all_data):
+    def _validate_paper_compliance(self, ea_df, val_df, eb_df, all_data):
         """Validate that datasets meet paper requirements."""
         print("\n" + "="*70)
         print("📋 PAPER COMPLIANCE VALIDATION")
@@ -332,8 +344,10 @@ class EvalLoaderComplete:
         
         # Size validation
         ea_size = len(ea_df)
+        val_size = len(val_df)
         eb_size = len(eb_df)
-        print(f"✅ Ea size: {ea_size:,} tweets (target: ~60,000)")
+        print(f"✅ Ea size: {ea_size:,} tweets (target: ~90,000)")
+        print(f"✅ Val size: {val_size:,} tweets (full 2021 year)")
         print(f"✅ Eb size: {eb_size:,} tweets (target: ~40,000)")
         
         # Balance validation for Ea
@@ -349,14 +363,18 @@ class EvalLoaderComplete:
         
         # Temporal coverage
         ea_date_range = f"{ea_df['date'].min().date()} to {ea_df['date'].max().date()}"
+        val_date_range = f"{val_df['date'].min().date()} to {val_df['date'].max().date()}"
         eb_date_range = f"{eb_df['date'].min().date()} to {eb_df['date'].max().date()}"
-        print(f"✅ Ea temporal coverage: {ea_date_range} (2020 only)")
-        print(f"✅ Eb temporal coverage: {eb_date_range} (excludes 2020)")
+        print(f"✅ Ea temporal coverage: {ea_date_range} (2019-2020)")
+        print(f"✅ Val temporal coverage: {val_date_range} (2021 stress-test)")
+        print(f"✅ Eb temporal coverage: {eb_date_range} (excludes 2019-2021)")
         
         # Enhanced labeling validation
         non_neutral_ea = (ea_df['Label'] != 'Neutral').sum()
+        non_neutral_val = (val_df['Label'] != 'Neutral').sum()
         non_neutral_eb = (eb_df['Label'] != 'Neutral').sum()
         print(f"✅ Ea actionable signals: {non_neutral_ea:,} ({non_neutral_ea/len(ea_df)*100:.1f}%)")
+        print(f"✅ Val actionable signals: {non_neutral_val:,} ({non_neutral_val/len(val_df)*100:.1f}%)")
         print(f"✅ Eb actionable signals: {non_neutral_eb:,} ({non_neutral_eb/len(eb_df)*100:.1f}%)")
         
         print(f"\n🎯 ENHANCED FEATURES IMPLEMENTED:")
@@ -378,7 +396,7 @@ def main():
         return
     
     try:
-        loader = EvalLoaderComplete(csv_path, config_path="config_ewma.yaml")
+        loader = EvalLoaderComplete(csv_path, config_path="config.yaml")
         result = loader.create_eval_datasets(n_folds=5)
         
         print("\n" + "="*70)

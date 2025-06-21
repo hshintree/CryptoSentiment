@@ -80,26 +80,20 @@ class Preprocessor:
         ## 3) Process volume data
         data = self._process_volume(data)
 
-        ## 4) Fill missing values
-        # Use forward fill first, then backward fill for any remaining NaNs
-        data = data.ffill().bfill()
-        
+        ## 4) Fill missing values causally
+        # Only forward-fill (propagate past into future), no backward-fill
+        data = data.ffill()
+        # Fill any initial NaNs in RSI/ROC with neutral defaults (no leakage)
+        if 'RSI' in data.columns:
+            neutral_rsi = sum(self.rsi_threshold) / 2  # midpoint between thresholds, e.g. 50
+            data['RSI'] = data['RSI'].fillna(neutral_rsi)
+        if 'ROC' in data.columns:
+            data['ROC'] = data['ROC'].fillna(0.0)
+        # Zero out any other residual NaNs (e.g. log_volume) safely
+        data = data.fillna(0)
         return data
 
-    def preprocess(self, data: pd.DataFrame) -> pd.DataFrame:
-        """
-        Legacy method for backward compatibility.
-        WARNING: This applies global scaling and should not be used in fold-wise training!
-        Use fit() and transform() instead for proper cross-validation.
-        """
-        data = self._compute_indicators(data)
-        
-        # ⚠️ GLOBAL SCALING - causes data leakage in cross-validation!
-        if {'RSI','ROC'}.issubset(data.columns):
-            scaler = MinMaxScaler()
-            data[['RSI','ROC']] = scaler.fit_transform(data[['RSI','ROC']])
-            
-        return data
+    # ⚠️ removed def preprocess to avoid accidental global scaling
 
     def fit(self, df: pd.DataFrame) -> pd.DataFrame:
         """Fit the RSI/ROC scaler on df, return scaled df."""

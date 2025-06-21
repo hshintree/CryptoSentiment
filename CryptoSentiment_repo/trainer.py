@@ -1,25 +1,33 @@
+import os
+# enable MPS→CPU fallback for any unsupported kernels
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
 # trainer.py  — hot-fix: ensure numeric hyper-parameters are cast to float/int
 import yaml
 import torch
+# MPS can be fragile with float64—force defaults to float32
+torch.set_default_dtype(torch.float32)
 from torch import nn
 import numpy as np
 import pandas as pd
 from typing import Any, Dict, Tuple
 from tqdm import tqdm
+from pathlib import Path
 
 from transformers import get_linear_schedule_with_warmup
-from transformers import DataCollatorWithPadding
 try:
     from transformers.optimization import AdamW          # HF ≥4.40
 except ImportError:
     from torch.optim import AdamW                        # fallback
 
 from torch.utils.data import DataLoader, Dataset
-from sklearn.model_selection import GroupKFold
-from sklearn.utils import shuffle
+# --- time-series split that is aware of "multiple rows per day" ----------
+from sklearn.model_selection import TimeSeriesSplit
+from collections import defaultdict          # ← we already imported numpy once
+from sklearn.metrics import confusion_matrix          # ➟ confusion-matrix
 
 from model                 import Model
-from market_labeler_ewma   import MarketLabelerEWMA
+from market_labeler_ewma   import MarketLabelerTBL, MarketFeatureGenerator
 
 
 class Trainer:
@@ -38,16 +46,38 @@ class Trainer:
         self.data  = data
         
         # ─── DEVICE SETUP ───────────────────────────────────────────
-        # MPS doesn’t yet support scaled_dot_product_attention — use CPU (or CUDA)
-        self.device = (
-            torch.device("cuda")
-            if torch.cuda.is_available()
-            else torch.device("cpu")
-        )
-        # move the model once
-        self.model.bert_model.to(self.device)
-        # (if you have any other submodules holding parameters, move them too)
+        # Prefer CUDA, then MPS, then CPU
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
+        print(f"Using device: {self.device}")
         
+        # if using MPS, force single-worker DataLoader to avoid pickle issues
+        if self.device.type == "mps":
+            torch.multiprocessing.set_sharing_strategy("file_system")
+            
+        # Override the model's detected device with trainer's device for consistency
+        self.model.device = self.device
+
+        # 2) move the whole HF model
+        self.model.bert_model.to(self.device)
+
+        # on MPS we need to convert the embedding weights
+        if self.device.type == "mps":
+            emb = self.model.bert_model.get_input_embeddings()
+            # rewrap as a real, allocated Parameter on MPS
+            emb.weight = nn.Parameter(emb.weight.to(self.device))
+            # if you have prompt-tuning, do the same for your prompt embeddings
+            if hasattr(self.model, "prompt_embeddings"):
+                self.model.prompt_embeddings = nn.Parameter(
+                    self.model.prompt_embeddings.to(self.device)
+                )
+
+        # 5) now recreate your optimizer so it sees real device tensors
+
         self.fold_states = []
 
         tcfg = self.config["training"]
@@ -58,46 +88,110 @@ class Trainer:
         self.warmup_frac   = float(tcfg.get("warmup_steps",  0.1))
         # -----------------------------------------------------------------
 
-        self.optimizer = AdamW(self.model.bert_model.parameters(),
-                               lr=self.learning_rate)
-        self.scheduler = None
-
+        # Set reproducibility seeds
+        seed = tcfg.get("seed", 42)
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+        self.optimizer = AdamW(self.model.bert_model.parameters(), lr=self.learning_rate)
     # ------------------------------------------------------------------  
     # Public API  
     # ------------------------------------------------------------------
     def train(self) -> None:
-        """5-fold grouped CV + standard training loop."""
+        """5-fold time-series CV + standard training loop."""
         data = self._prepare_data(self.data)
 
-        gkf = GroupKFold(n_splits=5)
-        
-        # Store original model config for reinitializing
-        original_model_cfg = self.model
+        # ----------------  split on UNIQUE DATES  -------------------------
+        gap_days = 30
+        unique_dates = (
+            self.data.assign(__day=self.data["Tweet Date"].dt.normalize())
+                .drop_duplicates("__day")
+                .sort_values("__day")
+                .reset_index()          # keep original tweet-row index
+                .rename(columns={"__day": "Day"})
+        )
+
+        # one row == one day  ➜ safe to use gap in DAYS
+        total_days = len(unique_dates)
+        test_days  = total_days // 5      # 20 % of days
+        max_splits = (total_days - gap_days) // test_days
+        n_splits   = min(5, max_splits)
+        if n_splits < 2:
+            raise ValueError(
+                f"too few days ({total_days}) for the requested gap/test sizes"
+            )
+
+        date_splitter = TimeSeriesSplit(
+            n_splits=n_splits,
+            test_size=test_days,
+            gap=gap_days,
+        )
+        print(f"Using Date-wise TimeSeriesSplit("
+              f"n_splits={n_splits}, test_days={test_days}, gap_days={gap_days})")
+
+        # ----- identical to market_labeler's day-level grouping ------------
+        day_series  = self.data["Tweet Date"].dt.normalize()   # 00:00 timestamps
+        day_to_rows = (
+            self.data
+                .assign(__day=day_series)
+                .groupby("__day", sort=False)["__day"]
+                .apply(lambda g: g.index.values)   # list of row indices per day
+                .to_dict()
+        )
+
+        def expand(day_idx):
+            """Convert scikit-learn's day indices → tweet-row indices."""
+            days = unique_dates.loc[list(day_idx), "Day"]   # Timestamp keys
+            rows = []
+            for d in days:
+                rows.extend(day_to_rows[d])
+            return np.asarray(rows, dtype=int)
         
         # ✅ TRAINING METRICS TRACKING
         fold_metrics = []
         
-        for fold, (tr_idx, va_idx) in enumerate(gkf.split(data,
-                                                         groups=data["group"])):
-            print(f"\n── Fold {fold+1}/{gkf.n_splits} ──")
+        for fold, (day_tr, day_val) in enumerate(date_splitter.split(unique_dates), 1):
+            tr_idx = expand(day_tr)
+            va_idx = expand(day_val)
+
+            # pretty diagnostic of the actual temporal split
+            train_dates = data.iloc[tr_idx]["Tweet Date"]
+            val_dates   = data.iloc[va_idx]["Tweet Date"]
+            print(f"Fold {fold}: "
+                  f"train ≤ {train_dates.max().date()}, "
+                  f"gap = {train_dates.max().date()+pd.Timedelta(days=1)} … "
+                  f"{val_dates.min().date()-pd.Timedelta(days=1)}, "
+                  f"val ≥ {val_dates.min().date()}")
+            print(f"\n── Fold {fold}/5 ──")
             
             # ✅ VALIDATE NO TRAIN/VAL OVERLAP
             train_set = set(tr_idx)
             val_set = set(va_idx)
-            assert not (train_set & val_set), f"❌ Fold {fold+1}: train/val overlap detected!"
-            print(f"✅ Fold {fold+1}: No train/val overlap (train={len(train_set)}, val={len(val_set)})")
+            assert not (train_set & val_set), f"❌ Fold {fold}: train/val overlap detected!"
+            print(f"✅ Fold {fold}: No train/val overlap (train={len(train_set)}, val={len(val_set)})")
             
             # ✅ REINITIALIZE MODEL & OPTIMIZER FOR EACH FOLD
-            print(f"🔄 Fold {fold+1}: Reinitializing model and optimizer...")
+            print(f"🔄 Fold {fold}: Reinitializing model and optimizer...")
             
-            # Create fresh model for this fold
+            # Create fresh model for this fold - force it to use trainer's device
             fold_model = Model(self.config["model"])
+            # Override the model's detected device with trainer's device
+            fold_model.device = self.device
             fold_model.bert_model.to(self.device)
+            if self.device.type == "mps":
+                emb = fold_model.bert_model.get_input_embeddings()
+                emb.weight = nn.Parameter(emb.weight.to(self.device))
+                if hasattr(fold_model, "prompt_embeddings"):
+                    fold_model.prompt_embeddings = nn.Parameter(
+                        fold_model.prompt_embeddings.to(self.device)
+                    )
             
             # Create fresh optimizer for this fold - only trainable parameters
             if hasattr(fold_model, 'use_prompt_tuning') and fold_model.use_prompt_tuning:
-                # Only optimize prompt embeddings + classifier for prompt-tuning
+                # Optimize prompt embeddings + last transformer layer + classifier for prompt-tuning
                 trainable_params = list(fold_model.bert_model.classifier.parameters())
+                trainable_params.extend(fold_model.bert_model.base_model.encoder.layer[-1].parameters())
                 if hasattr(fold_model, 'prompt_embeddings'):
                     trainable_params.append(fold_model.prompt_embeddings)
                 fold_optimizer = AdamW(trainable_params, lr=self.learning_rate)
@@ -117,21 +211,38 @@ class Trainer:
             tr_df = fold_preprocessor.fit_transform(tr_df)
             va_df = fold_preprocessor.transform(va_df)
             
-            # ✅ FOLD-WISE LABELING: Fit on training data, apply to both train/val
-            print(f"  🔬 Applying fold-wise labeling to prevent EWMA threshold leakage...")
-            fold_labeler = MarketLabelerEWMA("config_ewma.yaml")
-            
-            # Fit labeler on training data and apply labels
+            # ✅ FOLD-WISE LABELING: Batch-label with TBL
+            print(f"  🔬 Applying fold-wise TBL labeling…")
+            fold_labeler = MarketLabelerTBL("config.yaml")
             tr_df = fold_labeler.fit_and_label(tr_df)
-            # Apply same fitted thresholds to validation data  
             va_df = fold_labeler.apply_labels(va_df)
-            
-            # Recompute "Previous Label" separately for each split to prevent leakage
-            tr_df["Previous Label"] = tr_df["Label"].shift(1).fillna("Neutral") 
-            va_df["Previous Label"] = va_df["Label"].shift(1).fillna("Neutral")
+
+            # ✅ FOLD-WISE FEATURE: Generate causal 'Previous Label'
+            print(f"  🎯 Generating causal previous-label feature…")
+            feat_gen = MarketFeatureGenerator("config.yaml")
+            feat_gen.fit(tr_df)
+            tr_df["Previous Label"] = feat_gen.transform(tr_df)
+            va_df["Previous Label"] = feat_gen.transform(va_df)
+
+            # ── quick leakage sanity-check ρ(PrevLabel , Label) ─────────
+            _code = {"Bearish": 0, "Neutral": 1, "Bullish": 2}
+            corr = va_df.replace(_code)[["Previous Label", "Label"]].corr().iloc[0, 1]
+            print(f"ρ(Prev-Label , Label) = {corr:.3f}")
+            # If you ever see ≳0.9 here you have found a leak!
+            day_corr = (
+                va_df
+                .assign(day  = va_df["Tweet Date"].dt.normalize())
+                .groupby("day")[["Previous Label", "Label"]]
+                .first()                         # one row per day
+                .replace({"Bearish": 0, "Neutral": 1, "Bullish": 2})
+                .corr()
+                .iloc[0, 1]
+            )
+
+            print(f"ρ_day-level = {day_corr:.3f}")   # ← should be in the ~0.25–0.30 range
             
             # 🔍 DEBUG: Analyze data leakage potential
-            print(f"\n  🔍 FOLD {fold+1} DEBUG ANALYSIS:")
+            print(f"\n  🔍 FOLD {fold} DEBUG ANALYSIS:")
             
             # Check date ranges
             tr_dates = tr_df["Tweet Date"].dt.date
@@ -166,7 +277,7 @@ class Trainer:
             tr_prev = tr_df["Previous Label"].value_counts()
             va_prev = va_df["Previous Label"].value_counts()
             print(f"     Train prev labels: {dict(tr_prev)}")
-            print(f"     Val prev labels:   {dict(va_prev)}")
+            print(f"     Val   prev labels: {dict(va_prev)} (TBL-derived from market data)")
             
             # Check if we have the dreaded perfect correlation
             if len(tr_df) > 0 and len(va_df) > 0:
@@ -176,7 +287,7 @@ class Trainer:
                 print(f"     Train sample:")
                 for _, row in sample_tr.iterrows():
                     print(f"       {row['Tweet Date'].date()} | Label: {row['Label']:<8} | Prev: {row['Previous Label']:<8} | Price: ${row['Close']:.2f}")
-                print(f"     Val sample:")
+                print(f"     Val sample (Previous Labels from TBL market data):")
                 for _, row in sample_va.iterrows():
                     print(f"       {row['Tweet Date'].date()} | Label: {row['Label']:<8} | Prev: {row['Previous Label']:<8} | Price: ${row['Close']:.2f}")
             print()
@@ -195,14 +306,58 @@ class Trainer:
             fold_model.bert_model.train()
 
             # Track metrics for this fold
-            fold_history = {"fold": fold+1, "epochs": []}
+            fold_history = {"fold": fold, "epochs": []}
 
             for epoch in range(self.epochs):
-                loop = tqdm(tr_loader, desc=f"fold {fold+1} epoch {epoch+1}/{self.epochs}",
-                            leave=False)
+                loop = tqdm(tr_loader, desc=f"fold {fold} epoch {epoch+1}/{self.epochs}",
+                leave=False)
                 print(f"  Epoch {epoch+1}/{self.epochs}")
                 train_loss = self._train_one_epoch_fold(loop, fold_model, fold_optimizer, fold_scheduler)
-                val_loss, val_acc = self._evaluate_fold(va_loader, fold_model)
+                
+                # ── run validation with progress bar & capture preds ─────────
+                val_loss, val_acc, y_true, y_pred = self._evaluate_fold(
+                    va_loader, fold_model
+                )
+
+                # ---------------------------------------------------------
+                # 🧊  QUICK CHECKPOINT
+                # ---------------------------------------------------------
+                # always keep *one* epoch-checkpoint per fold on CPU
+                ckpt_root = Path("tmp_ckpts") / f"fold{fold}"
+                ckpt_root.mkdir(parents=True, exist_ok=True)
+
+                # nuke the previous epoch's ckpt (if any)
+                if epoch > 0:
+                    old = ckpt_root / f"epoch{epoch}.pt"
+                    if old.exists():
+                        old.unlink()
+
+                # store the new one – model is already on self.device, move →
+                fold_model.bert_model.to("cpu")
+                torch.save(
+                    {"state_dict": fold_model.bert_model.state_dict(),
+                     "epoch": epoch+1,
+                     "val_loss": float(val_loss)},
+                    ckpt_root / f"epoch{epoch+1}.pt"
+                )
+                # move back to device for next epoch's training pass
+                fold_model.bert_model.to(self.device)
+
+                # quick confusion matrix
+                cm = confusion_matrix(y_true, y_pred, labels=[0, 1, 2])
+                print(f"     Confusion matrix (rows=truth, cols=pred):\n{cm}")
+
+                # correlation Previous-Label ↔ Label on **val** split
+                code_map = {"Bearish": 0, "Neutral": 1, "Bullish": 2}
+                corr = va_df[["Previous Label", "Label"]].replace(code_map).corr().iloc[0, 1]
+                print(f"     Corr(PrevLabel , Label): {corr:.3f}")
+
+                # randomised-labels sanity baseline (use global `np`)
+                rand_acc = (np.random.permutation(y_true) == y_true).mean()
+                print(f"     Random-baseline acc      : {rand_acc:.3f}")
+
+                # gap printout
+                print(f"     Train vs Val loss gap    : {(val_loss - train_loss):.4f}")
                 
                 epoch_metrics = {
                     "epoch": epoch+1,
@@ -213,7 +368,7 @@ class Trainer:
                 fold_history["epochs"].append(epoch_metrics)
                 
                 # Clear, formatted metrics display
-                print(f"\n  📊 FOLD {fold+1} EPOCH {epoch+1} RESULTS:")
+                print(f"\n  📊 FOLD {fold} EPOCH {epoch+1} RESULTS:")
                 print(f"     Train Loss: {train_loss:.4f}")
                 print(f"     Val Loss:   {val_loss:.4f}")
                 print(f"     Val Acc:    {val_acc:.4f} ({val_acc*100:.1f}%)")
@@ -254,12 +409,23 @@ class Trainer:
             
             # Move model to CPU to free MPS memory for next fold
             fold_model.bert_model.to("cpu")
-            print(f"  💾 Moved Fold {fold+1} model to CPU to free MPS memory")
+            print(f"  💾 Moved Fold {fold} model to CPU to free MPS memory")
             
             # Store this fold's model (now on CPU)
             self.fold_states.append({"model": fold_model})
             
         print(f"\n✅ Training complete! {len(self.fold_states)} independent fold models created.")
+
+        # ── persist all epoch metrics for plotting ───────────────────────────
+        metrics_df = (
+            pd.json_normalize(
+                fold_metrics,
+                record_path=["epochs"],
+                meta=["fold"]
+            )
+        )
+        metrics_df.to_csv("epoch_metrics.csv", index=False)
+        print("📊 Per-epoch metrics saved ➟ epoch_metrics.csv")
         
         # Save training metrics
         import json
@@ -280,40 +446,18 @@ class Trainer:
         # DO NOT LABEL GLOBALLY - this would cause massive data leakage
         # Labeling will be done per-fold using fit_and_label() and apply_labels()
         
-        print("Preparing data for fold-wise labeling (no global labeling)...")
+        print("Preparing data for time-series CV (no global labeling)...")
         
         # Ensure we have the right column names
         if "date" in df.columns and "Tweet Date" not in df.columns:
             df = df.rename(columns={"date": "Tweet Date"})
         
-        # Only assign groups, don't label yet
-        data = df.copy()
-        data["group"] = self._assign_groups(data)
+        # Sort by date for TimeSeriesSplit (crucial for temporal ordering)
+        data = df.copy().sort_values("Tweet Date").reset_index(drop=True)
         return data
 
-    @staticmethod
-    def _assign_groups(df: pd.DataFrame) -> np.ndarray:
-        """Temporal grouping to prevent data leakage - group by date periods."""
-        # Get unique dates and sort them
-        unique_dates = sorted(df['Tweet Date'].dt.date.unique())
-        n_dates = len(unique_dates)
-        
-        # Divide dates into 5 temporal groups
-        dates_per_group = n_dates // 5
-        
-        # Create date-to-group mapping
-        date_to_group = {}
-        for i in range(5):
-            start_date_idx = i * dates_per_group
-            end_date_idx = (i + 1) * dates_per_group if i < 4 else n_dates
-            
-            for date_idx in range(start_date_idx, end_date_idx):
-                date_to_group[unique_dates[date_idx]] = i
-        
-        # Assign groups based on tweet dates
-        groups = df['Tweet Date'].dt.date.map(date_to_group).values
-        
-        return groups
+
+
 
 
     def _make_loader(self, df: pd.DataFrame, *, shuffle: bool) -> DataLoader:
@@ -341,12 +485,16 @@ class Trainer:
                 item["labels"] = torch.tensor(lbls[i])
                 return item
 
+        # on CUDA: multi‐worker + pin_memory; on MPS/CPU: single‐worker no pin_memory
+        num_workers = 4 if self.device.type == "cuda" else 0
+        pin_memory  = True if self.device.type == "cuda" else False
+        
         return DataLoader(
             _DS(),
             batch_size=self.batch_size,
             shuffle=shuffle,
-            num_workers=0 if self.device.type == 'mps' else 0,  # MPS doesn't pickle well, use 0
-            pin_memory=False,  # Disable pin_memory as it's not supported on MPS
+            num_workers=num_workers,
+            pin_memory=pin_memory,
         )
 
 
@@ -376,9 +524,9 @@ class Trainer:
                 print("  batch label distribution:", dict(zip(unique_labels, counts)))
             lbls  = batch.pop("labels")
             
-            # Filter out arguments that model expects
+            # Filter out arguments that model expects - only pass input_ids and attention_mask
             model_args = {k: v for k, v in batch.items() 
-                         if k in ["input_ids", "attention_mask", "token_type_ids"]}
+                         if k in ["input_ids", "attention_mask"]}
             
             # Use model's forward method (handles prompt-tuning automatically)
             logits = model.forward(model_args)
@@ -397,21 +545,24 @@ class Trainer:
         avg_train_loss = total_loss / max(num_batches, 1)
         return avg_train_loss
 
-    def _evaluate_fold(self, loader: DataLoader, model: Model) -> Tuple[float, float]:
+    def _evaluate_fold(
+        self, loader: DataLoader, model: Model
+    ) -> Tuple[float, float, list[int], list[int]]:
         model.bert_model.eval()
         correct = total = 0
         total_loss = 0.0
         num_batches = 0
         
+        y_true, y_pred = [], []
         with torch.no_grad():
-            for batch in loader:
+            for batch in tqdm(loader, desc="eval", leave=False):
                 # move to device
                 batch = {k: v.to(self.device) for k, v in batch.items()}
                 lbls = batch.pop("labels")
                 
-                # Filter out arguments that model expects
+                # Filter out arguments that model expects - only pass input_ids and attention_mask
                 model_args = {k: v for k, v in batch.items() 
-                             if k in ["input_ids", "attention_mask", "token_type_ids"]}
+                             if k in ["input_ids", "attention_mask"]}
                 
                 logits = model.forward(model_args)
                 preds = logits.argmax(dim=-1)
@@ -421,6 +572,8 @@ class Trainer:
                 total_loss += loss.item()
                 num_batches += 1
                 
+                y_true.extend(lbls.cpu().tolist())
+                y_pred.extend(preds.cpu().tolist())
                 correct += (preds == lbls).sum().item()
                 total += lbls.size(0)
         
@@ -428,7 +581,7 @@ class Trainer:
         acc = correct / max(total, 1)
         
         model.bert_model.train()
-        return avg_loss, acc
+        return avg_loss, acc, y_true, y_pred
 
 def cross_val_predict(trainer: "Trainer",
                       data: pd.DataFrame,
@@ -436,10 +589,10 @@ def cross_val_predict(trainer: "Trainer",
     """
     Run the already-trained 5 fold models on validation data only and return
     majority-vote label + confidence (mean softmax prob of winning class).
-    FIXED: Uses model's own predictions for Previous Label to prevent leakage.
+    Uses TBL-derived Previous Labels from market data (no model predictions).
     """
     from collections import defaultdict
-    from sklearn.model_selection import GroupKFold
+    from sklearn.model_selection import TimeSeriesSplit
     
     votes   = defaultdict(list)   # idx → [class_ids]
     confs   = defaultdict(list)   # idx → [prob_of_pred]
@@ -447,11 +600,49 @@ def cross_val_predict(trainer: "Trainer",
     # ensure inference uses the same device
     device = trainer.device
     
-    # Get the same grouping as training
+    # Get the same temporal splits as training
     data_grouped = trainer._prepare_data(data)
-    gkf = GroupKFold(n_splits=5)
+    gap_days = 30
+    unique_dates = (
+        data.assign(__day=data["Tweet Date"].dt.normalize())
+            .drop_duplicates("__day")
+            .sort_values("__day")
+            .reset_index()          # keep original tweet-row index
+            .rename(columns={"__day": "Day"})
+    )
+
+    # one row == one day  ➜ safe to use gap in DAYS
+    total_days = len(unique_dates)
+    test_days  = total_days // 5      # 20 % of days
+    max_splits = (total_days - gap_days) // test_days
+    n_splits   = min(5, max_splits)
+
+    # ----- same grouping trick as in train() / market_labeler -------------
+    day_series  = data["Tweet Date"].dt.normalize()
+    day_to_rows = (
+        data.assign(__day=day_series)
+            .groupby("__day", sort=False)["__day"]
+            .apply(lambda g: g.index.values)
+            .to_dict()
+    )
+
+    def expand(day_idx):
+        """Convert scikit-learn's day indices → tweet-row indices."""
+        days = unique_dates.loc[list(day_idx), "Day"]
+        rows = []
+        for d in days:
+            rows.extend(day_to_rows[d])
+        return np.asarray(rows, dtype=int)
+
+    date_splitter = TimeSeriesSplit(
+        n_splits=n_splits,
+        test_size=test_days,
+        gap=gap_days,
+    )
     
-    for fold_id, (tr_idx, va_idx) in enumerate(gkf.split(data_grouped, groups=data_grouped["group"])):
+    for fold_id, (day_tr, day_val) in enumerate(date_splitter.split(unique_dates)):
+        tr_idx = expand(day_tr)
+        va_idx = expand(day_val)
         if fold_id >= len(trainer.fold_states):
             break
             
@@ -460,62 +651,62 @@ def cross_val_predict(trainer: "Trainer",
         # Get validation data for this fold
         va_df = data_grouped.iloc[va_idx].copy()
         
-        # Process and label validation data (same as training)
+        # ── FOLD-WISE PREPROCESSING ───────────────────────────────────
+        # Fit on train split, then transform val split
         from preprocessor import Preprocessor
         fold_preprocessor = Preprocessor(trainer.config_path)
-        va_processed = fold_preprocessor.fit_transform(va_df)  # Use same preprocessing
+        tr_df = data_grouped.iloc[tr_idx].copy()
+        tr_processed = fold_preprocessor.fit_transform(tr_df)
+        va_processed = fold_preprocessor.transform(va_df)
         
-        from market_labeler_ewma import MarketLabelerEWMA
-        fold_labeler = MarketLabelerEWMA("config_ewma.yaml")
-        va_labeled = fold_labeler.fit_and_label(va_processed)  # Need labels for inference
-        
-        # Build Previous Label using MODEL PREDICTIONS (no leakage)
-        va_labeled = va_labeled.sort_values("Tweet Date").reset_index(drop=True)
-        prev_labels = ["Neutral"]  # Start with neutral
+        # ── FOLD-WISE LABELING ───────────────────────────────────────
+        from market_labeler_ewma import MarketLabelerTBL, MarketFeatureGenerator
+        fold_labeler = MarketLabelerTBL("config.yaml")
+        _ = fold_labeler.fit_and_label(tr_processed)
+        va_labeled = fold_labeler.apply_labels(va_processed)
+
+        feat_gen = MarketFeatureGenerator("config.yaml")
+        feat_gen.fit(tr_processed)
+        va_labeled["Previous Label"] = feat_gen.transform(va_labeled)
         
         # Temporarily move model to device
         model.bert_model.to(device)
         model.bert_model.eval()
         
+        # Process all validation data for this fold
         with torch.no_grad():
-            for i, row in va_labeled.iterrows():
-                # Use previous MODEL prediction as Previous Label
-                current_prev_label = prev_labels[-1] if prev_labels else "Neutral"
+            for i, (_, row) in enumerate(va_labeled.iterrows()):
+                original_idx = va_idx[i]
                 
-                # Create input with model's own previous prediction
+                # Create input with TBL-derived Previous Label
                 tok = model.preprocess_input(
                     tweet_content=row["Tweet Content"],
                     rsi=row["RSI"],
                     roc=row["ROC"],
-                    previous_label=current_prev_label,
+                    previous_label=row["Previous Label"],
                 )
                 
                 # Remove token_type_ids and move to device
                 if "token_type_ids" in tok:
                     del tok["token_type_ids"]
-                batch = {k: v.to(device) for k, v in tok.items()}
+                tok = {k: v.to(device) for k, v in tok.items()}
                 
                 # Get prediction
-                model_args = {k: v for k, v in batch.items() 
-                             if k in ["input_ids", "attention_mask", "token_type_ids"]}
+                model_args = {k: v for k, v in tok.items() 
+                             if k in ["input_ids", "attention_mask"]}
                 
                 logits = model.forward(model_args)
                 probs = torch.softmax(logits, dim=-1)
                 pred = probs.argmax(dim=-1).item()
                 
-                # Store vote
-                original_idx = va_idx[i]
+                # Store vote for this sample
                 votes[original_idx].append(pred)
                 confs[original_idx].append(probs[0, pred].item())
-                
-                # Update previous labels with this prediction
-                pred_label = {0: "Bearish", 1: "Neutral", 2: "Bullish"}[pred]
-                prev_labels.append(pred_label)
         
         # Move model back to CPU
         model.bert_model.to("cpu")
 
-    # majority + avg-confidence
+    # ── majority + avg-confidence ─────────────────────────────────
     maj_lbl = {i: max(set(votes[i]), key=votes[i].count) for i in votes}
     maj_cnf = {i: np.mean(confs[i]) for i in confs}
 
