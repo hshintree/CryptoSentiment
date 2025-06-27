@@ -4,6 +4,8 @@ os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 # trainer.py  — hot-fix: ensure numeric hyper-parameters are cast to float/int
 import yaml
+import json
+import csv
 import torch
 # MPS can be fragile with float64—force defaults to float32
 torch.set_default_dtype(torch.float32)
@@ -20,7 +22,7 @@ try:
 except ImportError:
     from torch.optim import AdamW                        # fallback
 
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 # --- time-series split that is aware of "multiple rows per day" ----------
 from sklearn.model_selection import TimeSeriesSplit
 from collections import defaultdict          # ← we already imported numpy once
@@ -79,6 +81,8 @@ class Trainer:
         # 5) now recreate your optimizer so it sees real device tensors
 
         self.fold_states = []
+        # ───────── NEW: container for confusion-matrices ──────────
+        self.cm_history: list[dict] = []
 
         tcfg = self.config["training"]
         # ---- cast YAML scalars safely -----------------------------------
@@ -102,67 +106,62 @@ class Trainer:
         """5-fold time-series CV + standard training loop."""
         data = self._prepare_data(self.data)
 
-        # ----------------  split on UNIQUE DATES  -------------------------
-        gap_days = 30
-        unique_dates = (
-            self.data.assign(__day=self.data["Tweet Date"].dt.normalize())
-                .drop_duplicates("__day")
-                .sort_values("__day")
-                .reset_index()          # keep original tweet-row index
-                .rename(columns={"__day": "Day"})
+        # ---------- 5-fold **Blocked** Purged CV (contiguous chunks) -------
+        gap_days   = 13
+        unique_days = (
+            self.data["Tweet Date"]
+                .dt.normalize()
+                .sort_values()
+                .drop_duplicates()
+                .reset_index(drop=True)
         )
+        n_days   = len(unique_days)
+        fold_len = n_days // 5
 
-        # one row == one day  ➜ safe to use gap in DAYS
-        total_days = len(unique_dates)
-        test_days  = total_days // 5      # 20 % of days
-        max_splits = (total_days - gap_days) // test_days
-        n_splits   = min(5, max_splits)
-        if n_splits < 2:
-            raise ValueError(
-                f"too few days ({total_days}) for the requested gap/test sizes"
-            )
-
-        date_splitter = TimeSeriesSplit(
-            n_splits=n_splits,
-            test_size=test_days,
-            gap=gap_days,
+        # map each tweet → its 0-based day index
+        day_lookup = pd.Series(
+            np.arange(n_days, dtype=int),
+            index=unique_days.values       # Timestamp → int
         )
-        print(f"Using Date-wise TimeSeriesSplit("
-              f"n_splits={n_splits}, test_days={test_days}, gap_days={gap_days})")
+        row_day_idx = day_lookup[self.data["Tweet Date"]
+                                 .dt.normalize()].values
 
-        # ----- identical to market_labeler's day-level grouping ------------
-        day_series  = self.data["Tweet Date"].dt.normalize()   # 00:00 timestamps
-        day_to_rows = (
-            self.data
-                .assign(__day=day_series)
-                .groupby("__day", sort=False)["__day"]
-                .apply(lambda g: g.index.values)   # list of row indices per day
-                .to_dict()
-        )
+        def blocked_purged_splits():
+            start = 0
+            for _fold in range(5):
+                stop = start + fold_len if _fold < 4 else n_days
+                val_idx = np.arange(start, stop, dtype=int)
 
-        def expand(day_idx):
-            """Convert scikit-learn's day indices → tweet-row indices."""
-            days = unique_dates.loc[list(day_idx), "Day"]   # Timestamp keys
-            rows = []
-            for d in days:
-                rows.extend(day_to_rows[d])
-            return np.asarray(rows, dtype=int)
-        
+                # purge ± gap_days around every validation day-id
+                purge_idx = {
+                    d for v in val_idx
+                    for d in range(max(0, v - gap_days),
+                                   min(n_days, v + gap_days + 1))
+                }
+                gap_rows   = np.where(np.isin(row_day_idx, purge_idx))[0]
+                train_rows = np.where(~np.isin(row_day_idx,
+                                               list(val_idx) + list(purge_idx)))[0]
+                val_rows   = np.where( np.isin(row_day_idx,  val_idx))[0]
+
+                if len(val_rows) and len(train_rows):
+                    yield train_rows, gap_rows, val_rows
+                start = stop
+
+        date_splitter = blocked_purged_splits()
+        print(f"Using 5-fold **Blocked** Purged CV (gap_days={gap_days})")
+
         # ✅ TRAINING METRICS TRACKING
         fold_metrics = []
         
-        for fold, (day_tr, day_val) in enumerate(date_splitter.split(unique_dates), 1):
-            tr_idx = expand(day_tr)
-            va_idx = expand(day_val)
+        for fold, (tr_idx, gap_idx, va_idx) in enumerate(date_splitter, 1):
 
             # pretty diagnostic of the actual temporal split
             train_dates = data.iloc[tr_idx]["Tweet Date"]
             val_dates   = data.iloc[va_idx]["Tweet Date"]
             print(f"Fold {fold}: "
-                  f"train ≤ {train_dates.max().date()}, "
-                  f"gap = {train_dates.max().date()+pd.Timedelta(days=1)} … "
-                  f"{val_dates.min().date()-pd.Timedelta(days=1)}, "
-                  f"val ≥ {val_dates.min().date()}")
+                  f"Train span : {train_dates.min().date()} … {train_dates.max().date()}"
+                  f"Val   span : {val_dates.min().date()} … {val_dates.max().date()}"
+                  f"Gap (min)  : {gap_days} days\n")
             print(f"\n── Fold {fold}/5 ──")
             
             # ✅ VALIDATE NO TRAIN/VAL OVERLAP
@@ -200,7 +199,9 @@ class Trainer:
                 # Standard fine-tuning
                 fold_optimizer = AdamW(fold_model.bert_model.parameters(), lr=self.learning_rate)
             
-            tr_df, va_df = data.iloc[tr_idx].copy(), data.iloc[va_idx].copy()
+            tr_df  = data.iloc[tr_idx].copy()          # will feed optimiser
+            gap_df = data.iloc[gap_idx].copy()         # NEVER enters optimiser
+            va_df  = data.iloc[va_idx].copy()
             
             # ✅ FOLD-WISE PREPROCESSING: Fit scaler on training data only
             print(f"  📊 Applying fold-wise preprocessing to prevent scaling leakage...")
@@ -208,25 +209,66 @@ class Trainer:
             fold_preprocessor = Preprocessor(self.config_path)
             
             # Fit preprocessor on training data and transform both splits
-            tr_df = fold_preprocessor.fit_transform(tr_df)
-            va_df = fold_preprocessor.transform(va_df)
+            tr_df  = fold_preprocessor.fit_transform(tr_df)
+            if not gap_df.empty:                      # ← skip empty gap slices
+                gap_df = fold_preprocessor.transform(gap_df)
+            va_df  = fold_preprocessor.transform(va_df)
             
             # ✅ FOLD-WISE LABELING: Batch-label with TBL
             print(f"  🔬 Applying fold-wise TBL labeling…")
-            fold_labeler = MarketLabelerTBL("config.yaml")
-            tr_df = fold_labeler.fit_and_label(tr_df)
-            va_df = fold_labeler.apply_labels(va_df)
+            fold_lbl = MarketLabelerTBL("config.yaml")
+            tr_df  = fold_lbl.fit_and_label(tr_df)
+            if not gap_df.empty:
+                gap_df = fold_lbl.apply_labels(gap_df)
+            va_df  = fold_lbl.apply_labels(va_df)
 
             # ✅ FOLD-WISE FEATURE: Generate causal 'Previous Label'
             print(f"  🎯 Generating causal previous-label feature…")
-            feat_gen = MarketFeatureGenerator("config.yaml")
-            feat_gen.fit(tr_df)
+            # include *gap* rows when building the day→label map
+            if not gap_df.empty:
+                feat_gen = MarketFeatureGenerator().fit(
+                    pd.concat([tr_df, gap_df], ignore_index=True)
+                )
+                gap_df["Previous Label"] = feat_gen.transform(gap_df)   # only for corr-checks
+            else:
+                feat_gen = MarketFeatureGenerator().fit(tr_df)
             tr_df["Previous Label"] = feat_gen.transform(tr_df)
             va_df["Previous Label"] = feat_gen.transform(va_df)
 
-            # ── quick leakage sanity-check ρ(PrevLabel , Label) ─────────
+            # ── Correlations (raw & per-fold) ──────────────────────────────
             _code = {"Bearish": 0, "Neutral": 1, "Bullish": 2}
-            corr = va_df.replace(_code)[["Previous Label", "Label"]].corr().iloc[0, 1]
+
+            # (A)  **fold-local**  — raw RSI/ROC (inverse-scaled)
+            raw_val = va_df.copy()
+            raw_val[["RSI", "ROC"]] = (
+                fold_preprocessor.scaler.inverse_transform(
+                    raw_val[["RSI", "ROC"]]
+                )
+            )
+            encoded = raw_val.replace(_code)
+
+            feature_cols = [
+                "Previous Label", "RSI", "ROC", "Volume",
+                "has_user_metadata", "has_tweet_metadata", "user_followers",
+            ]
+            feature_corrs = {}
+            for col in feature_cols:
+                if col not in encoded.columns:
+                    continue            # skip missing columns gracefully
+                try:
+                    x = pd.to_numeric(encoded[col], errors="coerce")
+                except Exception:
+                    continue
+                c = np.corrcoef(x.fillna(0), encoded["Label"])[0, 1]
+                if not np.isnan(c):
+                    feature_corrs[col] = c
+
+            print("ρ(feature , Label) on *this fold*:")
+            for k, v in sorted(feature_corrs.items(), key=lambda kv: -abs(kv[1])):
+                print(f"   {k:<18}: {v:+.3f}")
+
+            # keep the old single-feature print for consistency
+            corr = feature_corrs.get("Previous Label", np.nan)
             print(f"ρ(Prev-Label , Label) = {corr:.3f}")
             # If you ever see ≳0.9 here you have found a leak!
             day_corr = (
@@ -239,7 +281,63 @@ class Trainer:
                 .iloc[0, 1]
             )
 
-            print(f"ρ_day-level = {day_corr:.3f}")   # ← should be in the ~0.25–0.30 range
+            print(f"ρ_day-level = {day_corr:.3f}")   # paper ≈ 0.25–0.30
+
+            # ── extra daily-level correlations for RSI/ROC ────────────────
+            daily_val = (
+                va_df.groupby(va_df["Tweet Date"].dt.normalize())
+                     .first()                     # one row per day
+                     .replace(_code)
+            )
+            for ind in ("RSI", "ROC"):
+                if ind in daily_val.columns:
+                    c = daily_val[[ind, "Label"]].corr().iloc[0, 1]
+                    print(f"      ↳ {ind:3}  day-level corr : {c:+.3f}")
+
+            # (B)  **optional EA-wide diagnostic** – now the safe way
+            if fold == 1 and not hasattr(self, "_global_corr_done"):
+                # --- 1. same preprocessing -------------------------------
+                full_raw = fold_preprocessor.transform(data.copy())
+                full_raw[["RSI", "ROC"]] = fold_preprocessor.scaler.inverse_transform(
+                    full_raw[["RSI", "ROC"]]
+                )
+
+                # --- 2. label entire EA once (no peeking) ---------------
+                ea_labeler = MarketLabelerTBL("config.yaml")
+                full_raw   = ea_labeler.fit_and_label(full_raw)
+
+                # --- 3. causal previous-label ---------------------------
+                feat_gen_global = MarketFeatureGenerator()
+                full_raw["Previous Label"] = feat_gen_global.transform(full_raw)
+
+                # --- 4. day-level aggregates & correlations -------------
+                daily_mean = (
+                    full_raw
+                    .groupby(full_raw["Tweet Date"].dt.normalize())
+                    .agg({
+                        "Previous Label": "first",   # regime is discrete
+                        "RSI":            "mean",
+                        "ROC":            "mean",
+                        "Volume":         "mean",
+                        "Label":          "first",
+                    })
+                    .replace(_code)
+                )
+                gcorr = (
+                    daily_mean[["Previous Label", "RSI", "ROC", "Volume", "Label"]]
+                    .corr()
+                    .iloc[:-1, -1]    # everything versus ground-truth Label
+                )
+
+                print("\n🌐 ρ(feature , Label) on *entire EA* (day-level, mean-aggregated):")
+                for k, v in gcorr.abs().sort_values(ascending=False).items():
+                    print(f"   {k:<18}: {v:+.3f}")
+
+                # extra print focused on RSI/ROC only
+                print(f"      ↳ RSI  day-level corr : {gcorr['RSI']:+.3f}")
+                print(f"      ↳ ROC  day-level corr : {gcorr['ROC']:+.3f}")
+
+                self._global_corr_done = True
             
             # 🔍 DEBUG: Analyze data leakage potential
             print(f"\n  🔍 FOLD {fold} DEBUG ANALYSIS:")
@@ -319,33 +417,55 @@ class Trainer:
                     va_loader, fold_model
                 )
 
-                # ---------------------------------------------------------
-                # 🧊  QUICK CHECKPOINT
-                # ---------------------------------------------------------
-                # always keep *one* epoch-checkpoint per fold on CPU
-                ckpt_root = Path("tmp_ckpts") / f"fold{fold}"
-                ckpt_root.mkdir(parents=True, exist_ok=True)
+                # -----------------------------------------------------------------
+                # 🧊  ONE-CHECKPOINT POLICY
+                #     Keep only the *best* epoch for this fold on disk:
+                #         models/ea_<ts>/fold3/      (config.json + pytorch_model.bin)
+                # -----------------------------------------------------------------
+                ckpt_dir = Path("models") / f"ea_{self.config.get('run_id','')}" \
+                           / f"fold{fold}"
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-                # nuke the previous epoch's ckpt (if any)
-                if epoch > 0:
-                    old = ckpt_root / f"epoch{epoch}.pt"
-                    if old.exists():
-                        old.unlink()
+                best_path = ckpt_dir / "metrics.json"
+                prev_best = 9e9
+                if best_path.exists():
+                    prev_best = json.load(open(best_path))["val_loss"]
 
-                # store the new one – model is already on self.device, move →
-                fold_model.bert_model.to("cpu")
-                torch.save(
-                    {"state_dict": fold_model.bert_model.state_dict(),
-                     "epoch": epoch+1,
-                     "val_loss": float(val_loss)},
-                    ckpt_root / f"epoch{epoch+1}.pt"
-                )
-                # move back to device for next epoch's training pass
+                if val_loss < prev_best:                     # IMPROVED ✔
+                    # wipe old files
+                    for f in ckpt_dir.glob("*"):
+                        f.unlink()
+
+                    fold_model.bert_model.to("cpu")
+                    fold_model.bert_model.save_pretrained(ckpt_dir)
+                    fold_model.tokenizer.save_pretrained(ckpt_dir)
+
+                    json.dump({"epoch": epoch+1,
+                               "val_loss": float(val_loss)},
+                              open(best_path, "w"))
+
+                    print(f"     💾  Saved new best for fold{fold} (val_loss={val_loss:.4f})")
+                else:
+                    print(f"     ⏩  No improvement – best remains {prev_best:.4f}")
+
                 fold_model.bert_model.to(self.device)
 
                 # quick confusion matrix
                 cm = confusion_matrix(y_true, y_pred, labels=[0, 1, 2])
                 print(f"     Confusion matrix (rows=truth, cols=pred):\n{cm}")
+
+                # ─── NEW: store it ────────────────────────────────
+                self.cm_history.append(
+                    {
+                        "fold":   fold,
+                        "epoch":  epoch + 1,
+                        "cm_00":  int(cm[0, 0]), "cm_01": int(cm[0, 1]), "cm_02": int(cm[0, 2]),
+                        "cm_10":  int(cm[1, 0]), "cm_11": int(cm[1, 1]), "cm_12": int(cm[1, 2]),
+                        "cm_20":  int(cm[2, 0]), "cm_21": int(cm[2, 1]), "cm_22": int(cm[2, 2]),
+                        "val_acc": round(val_acc, 4),
+                        "val_loss": round(val_loss, 4)
+                    }
+                )
 
                 # correlation Previous-Label ↔ Label on **val** split
                 code_map = {"Bearish": 0, "Neutral": 1, "Bullish": 2}
@@ -427,11 +547,19 @@ class Trainer:
         metrics_df.to_csv("epoch_metrics.csv", index=False)
         print("📊 Per-epoch metrics saved ➟ epoch_metrics.csv")
         
-        # Save training metrics
-        import json
+        # Save training metrics (json already imported at top – don't shadow!)
         with open("training_metrics.json", "w") as f:
             json.dump(fold_metrics, f, indent=2)
         print("📊 Training metrics saved to training_metrics.json")
+
+        # ─── NEW: persist confusion-matrix history ────────────────
+        with open("confusion_matrices.json", "w") as f:
+            json.dump(self.cm_history, f, indent=2)
+
+        with open("confusion_matrices.csv", "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.cm_history[0].keys())
+            writer.writeheader(); writer.writerows(self.cm_history)
+        print("📊 Confusion-matrices saved ➟ confusion_matrices.{json,csv}")
         
         if hasattr(self, "fold_states"):
             pred_df = cross_val_predict(self, data)
@@ -489,10 +617,36 @@ class Trainer:
         num_workers = 4 if self.device.type == "cuda" else 0
         pin_memory  = True if self.device.type == "cuda" else False
         
+        # -----------------------------------------------------------------
+        # (TRAIN)   Balanced sampling to fight Neutral domination
+        # (VAL/TEST) keep natural order & skew
+        # -----------------------------------------------------------------
+        if shuffle:
+            y = np.array(lbls)                       # 0-Bear,1-Neut,2-Bull
+            freq = np.bincount(y, minlength=3)
+            alpha = 0.5                              # 0=no rebalance, 1=full
+            w_cls = (1.0 / np.maximum(freq, 1)) ** alpha
+            weights = w_cls[y]
+
+            sampler = WeightedRandomSampler(
+                weights,
+                num_samples=len(y),                  # epoch length unchanged
+                replacement=True,
+            )
+
+            return DataLoader(
+                _DS(),
+                batch_size=self.batch_size,
+                sampler=sampler,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+            )
+
+        # ── validation loader ────────────────────────────────────────────
         return DataLoader(
             _DS(),
             batch_size=self.batch_size,
-            shuffle=shuffle,
+            shuffle=False,
             num_workers=num_workers,
             pin_memory=pin_memory,
         )
@@ -530,7 +684,16 @@ class Trainer:
             
             # Use model's forward method (handles prompt-tuning automatically)
             logits = model.forward(model_args)
-            loss = torch.nn.functional.cross_entropy(logits, lbls)
+            
+            # cost matrix so flips → 2 × penalty (was 3), Neutral errors → 1 ×
+            cost = torch.tensor([[0,1,2],
+                                [1,0,1],
+                                [2,1,0]], device=logits.device, dtype=logits.dtype)
+            # compute expected cost
+            probs = torch.softmax(logits, dim=-1)
+            ce     = torch.nn.functional.cross_entropy(logits, lbls, reduction='none')
+            flip_c = cost[lbls, probs.argmax(dim=-1)]
+            loss   = (ce * (1 + flip_c)).mean()
             
             # Track loss
             total_loss += loss.item()
@@ -565,7 +728,15 @@ class Trainer:
                              if k in ["input_ids", "attention_mask"]}
                 
                 logits = model.forward(model_args)
-                preds = logits.argmax(dim=-1)
+                probs  = torch.softmax(logits, dim=-1)      # [B,3]
+
+                # ── confidence gating ─────────────────────
+                pred_idx = probs.argmax(dim=-1)             # [B]
+                # grab the probability of the chosen class for every item
+                conf = probs.gather(1, pred_idx.unsqueeze(1)).squeeze(1)  # [B]
+                low_conf = conf < 0.35
+                pred_idx[low_conf] = 1                      # force to Neutral
+                preds = pred_idx
                 
                 # Calculate loss and accuracy
                 loss = torch.nn.functional.cross_entropy(logits, lbls)
@@ -583,137 +754,147 @@ class Trainer:
         model.bert_model.train()
         return avg_loss, acc, y_true, y_pred
 
-def cross_val_predict(trainer: "Trainer",
-                      data: pd.DataFrame,
-                      cfg_path: str = "config.yaml") -> pd.DataFrame:
+def cross_val_predict(
+    trainer: "Trainer",
+    data: pd.DataFrame,
+    cfg_path: str = "config.yaml",
+    gap_days: int = 13,
+) -> pd.DataFrame:
     """
-    Run the already-trained 5 fold models on validation data only and return
-    majority-vote label + confidence (mean softmax prob of winning class).
-    Uses TBL-derived Previous Labels from market data (no model predictions).
+    Run the already-trained fold models on *their own* validation slices and
+    return, for every tweet row that was ever in a val split:
+        • Pred_Label  – majority vote of the folds that predicted it
+        • Pred_Conf   – mean softmax prob of that majority label
+    Rows that never fell into a validation window keep NaNs.
     """
-    from collections import defaultdict
-    from sklearn.model_selection import TimeSeriesSplit
-    
-    votes   = defaultdict(list)   # idx → [class_ids]
-    confs   = defaultdict(list)   # idx → [prob_of_pred]
+    # ---------- reproduce the blocked-purged day splits --------------------
+    data = trainer._prepare_data(data)              # ensures date sort
+    unique_days = (
+        data["Tweet Date"].dt.normalize()
+            .sort_values().drop_duplicates()
+            .reset_index(drop=True)
+    )
+    n_days   = len(unique_days)
+    fold_len = n_days // 5
 
-    # ensure inference uses the same device
+    day_lookup = pd.Series(
+        np.arange(n_days, dtype=int),
+        index=unique_days.values            # Timestamp → 0-based int
+    )
+    row_day_idx = day_lookup[data["Tweet Date"].dt.normalize()].values
+
+    # ---------- helpers ----------------------------------------------------
+    votes = defaultdict(list)          # row-idx → list[int label_id]
+    confs = defaultdict(list)          # row-idx → list[float prob]
+
+    from preprocessor import Preprocessor
+    from market_labeler_ewma import MarketLabelerTBL, MarketFeatureGenerator
+
     device = trainer.device
-    
-    # Get the same temporal splits as training
-    data_grouped = trainer._prepare_data(data)
-    gap_days = 30
-    unique_dates = (
-        data.assign(__day=data["Tweet Date"].dt.normalize())
-            .drop_duplicates("__day")
-            .sort_values("__day")
-            .reset_index()          # keep original tweet-row index
-            .rename(columns={"__day": "Day"})
-    )
 
-    # one row == one day  ➜ safe to use gap in DAYS
-    total_days = len(unique_dates)
-    test_days  = total_days // 5      # 20 % of days
-    max_splits = (total_days - gap_days) // test_days
-    n_splits   = min(5, max_splits)
+    start = 0
+    for fold_id, fold_state in enumerate(trainer.fold_states, 1):
+        stop = start + fold_len if fold_id < 5 else n_days
+        val_days = np.arange(start, stop, dtype=int)
 
-    # ----- same grouping trick as in train() / market_labeler -------------
-    day_series  = data["Tweet Date"].dt.normalize()
-    day_to_rows = (
-        data.assign(__day=day_series)
-            .groupby("__day", sort=False)["__day"]
-            .apply(lambda g: g.index.values)
-            .to_dict()
-    )
+        purge_days = {
+            d for v in val_days
+            for d in range(max(0, v - gap_days),
+                           min(n_days, v + gap_days + 1))
+        }
+        train_rows = np.where(~np.isin(row_day_idx,
+                                       list(val_days) + list(purge_days)))[0]
+        gap_rows   = np.where( np.isin(row_day_idx, purge_days))[0]
+        val_rows   = np.where( np.isin(row_day_idx,  val_days))[0]
 
-    def expand(day_idx):
-        """Convert scikit-learn's day indices → tweet-row indices."""
-        days = unique_dates.loc[list(day_idx), "Day"]
-        rows = []
-        for d in days:
-            rows.extend(day_to_rows[d])
-        return np.asarray(rows, dtype=int)
+        if not len(val_rows):
+            start = stop;  continue      # safety – should not happen
 
-    date_splitter = TimeSeriesSplit(
-        n_splits=n_splits,
-        test_size=test_days,
-        gap=gap_days,
-    )
-    
-    for fold_id, (day_tr, day_val) in enumerate(date_splitter.split(unique_dates)):
-        tr_idx = expand(day_tr)
-        va_idx = expand(day_val)
-        if fold_id >= len(trainer.fold_states):
-            break
-            
-        model = trainer.fold_states[fold_id]["model"]
-        
-        # Get validation data for this fold
-        va_df = data_grouped.iloc[va_idx].copy()
-        
-        # ── FOLD-WISE PREPROCESSING ───────────────────────────────────
-        # Fit on train split, then transform val split
-        from preprocessor import Preprocessor
-        fold_preprocessor = Preprocessor(trainer.config_path)
-        tr_df = data_grouped.iloc[tr_idx].copy()
-        tr_processed = fold_preprocessor.fit_transform(tr_df)
-        va_processed = fold_preprocessor.transform(va_df)
-        
-        # ── FOLD-WISE LABELING ───────────────────────────────────────
-        from market_labeler_ewma import MarketLabelerTBL, MarketFeatureGenerator
-        fold_labeler = MarketLabelerTBL("config.yaml")
-        _ = fold_labeler.fit_and_label(tr_processed)
-        va_labeled = fold_labeler.apply_labels(va_processed)
+        # ---------- fold-specific preprocessing & labelling -------------
+        fold_pre = Preprocessor(cfg_path)
+        tr_df  = fold_pre.fit_transform(data.iloc[train_rows].copy())
+        # gap slice may be empty ─→ only transform if we have rows
+        if len(gap_rows):
+            gap_df = fold_pre.transform(data.iloc[gap_rows].copy())
+        else:                               # keep a typed, empty frame
+            gap_df = pd.DataFrame(columns=data.columns)
+        va_df  = fold_pre.transform   (data.iloc[val_rows].copy())
 
-        feat_gen = MarketFeatureGenerator("config.yaml")
-        feat_gen.fit(tr_processed)
-        va_labeled["Previous Label"] = feat_gen.transform(va_labeled)
-        
-        # Temporarily move model to device
+        # ── 1  label training / validation with exactly the same fitter ──
+        fold_lbl = MarketLabelerTBL(cfg_path)
+        tr_df  = fold_lbl.fit_and_label(tr_df)   # KEEP the labelled copy
+        if not gap_df.empty:
+            gap_df = fold_lbl.apply_labels(gap_df)
+        va_df  = fold_lbl.apply_labels(va_df)
+
+        # ── 2  causal Previous-Label feature (needs the "Label" col) ─────
+        if not gap_df.empty:
+            feat_gen = MarketFeatureGenerator().fit(
+                pd.concat([tr_df, gap_df], ignore_index=True)
+            )
+            gap_df["Previous Label"] = feat_gen.transform(gap_df)
+        else:
+            feat_gen = MarketFeatureGenerator().fit(tr_df)
+        tr_df["Previous Label"] = feat_gen.transform(tr_df)   # optional – tidy
+        va_df["Previous Label"] = feat_gen.transform(va_df)
+
+        # ---------- inference -------------------------------------------
+        model = fold_state["model"]
         model.bert_model.to(device)
         model.bert_model.eval()
-        
-        # Process all validation data for this fold
+
         with torch.no_grad():
-            for i, (_, row) in enumerate(va_labeled.iterrows()):
-                original_idx = va_idx[i]
-                
-                # Create input with TBL-derived Previous Label
+            for ridx, row in zip(val_rows,
+                                 va_df.itertuples(index=False, name=None)):
+                # ------------------------------------------------------------------
+                # column order in .itertuples(name=None) is exactly df.columns
+                # so we can pick by position instead of worrying about the space/underscore
+                # ------------------------------------------------------------------
+                tweet_txt      = row[va_df.columns.get_loc("Tweet Content")]
+                rsi_val        = row[va_df.columns.get_loc("RSI")]
+                roc_val        = row[va_df.columns.get_loc("ROC")]
+                prev_lbl       = row[va_df.columns.get_loc("Previous Label")]
+
                 tok = model.preprocess_input(
-                    tweet_content=row["Tweet Content"],
-                    rsi=row["RSI"],
-                    roc=row["ROC"],
-                    previous_label=row["Previous Label"],
+                    tweet_content=tweet_txt,
+                    rsi=rsi_val,
+                    roc=roc_val,
+                    previous_label=prev_lbl,
                 )
-                
-                # Remove token_type_ids and move to device
-                if "token_type_ids" in tok:
-                    del tok["token_type_ids"]
+                tok.pop("token_type_ids", None)
                 tok = {k: v.to(device) for k, v in tok.items()}
+
+                logits = model.forward({k: v for k, v in tok.items()
+                                        if k in ("input_ids", "attention_mask")})
+                probs = torch.softmax(logits, dim=-1)[0]
                 
-                # Get prediction
-                model_args = {k: v for k, v in tok.items() 
-                             if k in ["input_ids", "attention_mask"]}
+                # Confidence gating
+                pred_idx = probs.argmax().item()
+                conf = probs[pred_idx].item()
+                # Apply confidence threshold - if confidence < 0.35, predict Neutral
+                if conf < 0.35:
+                    pred_idx = 1          # Neutral
                 
-                logits = model.forward(model_args)
-                probs = torch.softmax(logits, dim=-1)
-                pred = probs.argmax(dim=-1).item()
-                
-                # Store vote for this sample
-                votes[original_idx].append(pred)
-                confs[original_idx].append(probs[0, pred].item())
-        
-        # Move model back to CPU
+                pred = pred_idx
+
+                votes[ridx].append(pred)
+                confs[ridx].append(probs[pred].item())
+
         model.bert_model.to("cpu")
+        start = stop
 
-    # ── majority + avg-confidence ─────────────────────────────────
-    maj_lbl = {i: max(set(votes[i]), key=votes[i].count) for i in votes}
-    maj_cnf = {i: np.mean(confs[i]) for i in confs}
-
+    # ---------- assemble output -------------------------------------------
     out = data.copy()
-    out["Pred_Label"]   = out.index.map(maj_lbl)
-    out["Pred_Conf"]    = out.index.map(maj_cnf)
-    out["Pred_Label"]   = out["Pred_Label"].map({0: "Bearish",
-                                                 1: "Neutral",
-                                                 2: "Bullish"})
+    out["Pred_Label"] = pd.NA
+    out["Pred_Conf"]  = np.nan
+
+    if votes:
+        maj = {i: max(set(v), key=v.count) for i, v in votes.items()}
+        cnf = {i: np.mean(confs[i])       for i in votes.keys()}
+
+        out.loc[list(maj.keys()), "Pred_Label"] = pd.Series(maj).map({
+            0: "Bearish", 1: "Neutral", 2: "Bullish"
+        })
+        out.loc[list(cnf.keys()), "Pred_Conf"]  = pd.Series(cnf)
+
     return out

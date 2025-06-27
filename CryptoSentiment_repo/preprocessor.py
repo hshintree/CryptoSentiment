@@ -14,7 +14,8 @@ class Preprocessor:
             self.config = yaml.safe_load(file)
         self.settings = self.config['data']['preprocessing_steps']
         self.rsi_threshold   = self.config['data'].get('rsi_threshold', [30, 70])
-        self.roc_window_length = self.config['data'].get('roc_window_length', 8)
+        # 12-day ROC default (paper)
+        self.roc_window_length = self.config['data'].get('roc_window_length', 12)
         # lemmatizer once
         if self.settings.get('lemmatization', False):
             self.lemmatizer = WordNetLemmatizer()
@@ -75,7 +76,11 @@ class Preprocessor:
             loss = (-delta).clip(lower=0).rolling(window=14).mean()
             rs = gain / loss
             data['RSI'] = 100 - (100 / (1 + rs))
-            data['ROC'] = data['Close'].pct_change(periods=self.roc_window_length) * 100
+            data['ROC'] = (
+                data['Close']
+                    .pct_change(periods=self.roc_window_length)
+                    .mul(100)
+            )
 
         ## 3) Process volume data
         data = self._process_volume(data)

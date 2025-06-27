@@ -176,6 +176,7 @@ class MarketLabelerTBL:
         lower = np.empty(n) 
         label = np.empty(n, dtype=object)
         vertical_barrier = np.empty(n)
+        barrier_end_date = np.empty(n, dtype="datetime64[ns]")
         volatility = np.empty(n)
 
         # Rolling optimization on daily price data
@@ -196,12 +197,13 @@ class MarketLabelerTBL:
             daily_window = daily_prices.iloc[daily_start:daily_end]
             self._apply_enhanced_tbl_to_window(
                 df, daily_window, fu, fl, vt, 
-                upper, lower, label, vertical_barrier, volatility
+                upper, lower, label, vertical_barrier, barrier_end_date, volatility
             )
 
         df["Upper Barrier"] = upper
         df["Lower Barrier"] = lower
         df["Vertical Barrier"] = vertical_barrier
+        df["Barrier End Date"] = pd.to_datetime(barrier_end_date)
         df["Volatility"] = volatility
         df["Label"] = label
         
@@ -315,6 +317,7 @@ class MarketLabelerTBL:
         lower = np.empty(n) 
         label = np.empty(n, dtype=object)
         vertical_barrier = np.empty(n)
+        barrier_end_date = np.empty(n, dtype="datetime64[ns]")
         volatility = np.empty(n)
         
         # Use default parameters for simplicity in fold-wise training
@@ -323,12 +326,13 @@ class MarketLabelerTBL:
         # Apply TBL to all tweets
         self._apply_enhanced_tbl_to_window(
             df, daily_prices, fu, fl, vt, 
-            upper, lower, label, vertical_barrier, volatility
+            upper, lower, label, vertical_barrier, barrier_end_date, volatility
         )
         
         df["Upper Barrier"] = upper
         df["Lower Barrier"] = lower
         df["Vertical Barrier"] = vertical_barrier
+        df["Barrier End Date"] = pd.to_datetime(barrier_end_date)
         df["Volatility"] = volatility
         df["Label"] = label
         
@@ -383,6 +387,7 @@ class MarketLabelerTBL:
         lower: np.ndarray,
         label: np.ndarray,
         vertical_barrier: np.ndarray,
+        barrier_end_date: np.ndarray,
         volatility: np.ndarray
     ):
         """Apply enhanced TBL with volatility-adjusted barriers and trend constraints."""
@@ -411,6 +416,7 @@ class MarketLabelerTBL:
                 upper[tweet_idx]           = tweet_price * 1.02
                 lower[tweet_idx]           = tweet_price * 0.98
                 vertical_barrier[tweet_idx] = vt
+                barrier_end_date[tweet_idx] = df.at[tweet_idx, "date"] + pd.Timedelta(days=vt)
                 volatility[tweet_idx]      = 0.02
                 label[tweet_idx]           = "Neutral"
                 continue
@@ -427,19 +433,22 @@ class MarketLabelerTBL:
             upper[tweet_idx]           = tweet_price + tweet_price * ewma_vol * fu
             lower[tweet_idx]           = tweet_price - tweet_price * ewma_vol * fl
             vertical_barrier[tweet_idx] = vt
+            barrier_end_date[tweet_idx] = df.at[tweet_idx, "date"] + pd.Timedelta(days=vt)
             volatility[tweet_idx]      = ewma_vol
 
-            # look at the next vt **trading** days from our reset window_prices
+            # ── examine the future path (≤ vt trading days) ───────────────
             future_end    = min(daily_idx + vt, len(window_prices) - 1)
             future_prices = window_prices["Close"].iloc[daily_idx : future_end + 1].values
 
-            # enforce the 2-day minimum, then do the TBL pick
-            label[tweet_idx] = self._enhanced_tbl_logic(
+            label[tweet_idx], offset = self._enhanced_tbl_logic_with_offset(
                 future_prices,
                 upper[tweet_idx],
                 lower[tweet_idx],
                 min_days=2
             )
+            # store when that regime actually finished
+            end_pos = min(daily_idx + offset, len(window_prices) - 1)
+            barrier_end_date[tweet_idx] = window_prices.at[end_pos, "date"].normalize()
 
 
     def _enhanced_tbl_logic(self, future_prices: np.ndarray, upper_barrier: float, 
@@ -480,6 +489,49 @@ class MarketLabelerTBL:
             return "Bearish"
         else:
             return "Neutral"
+
+    def _enhanced_tbl_logic_with_offset(self, future_prices: np.ndarray,
+                                        upper_barrier: float,
+                                        lower_barrier: float,
+                                        min_days: int = 2) -> tuple[str,int]:
+        """
+        Enhanced TBL logic with 2-day minimum trend enforcement and offset tracking.
+        
+        Args:
+            future_prices: Price path starting from current day
+            upper_barrier: Upper barrier level
+            lower_barrier: Lower barrier level
+            min_days: Minimum days before allowing barrier hits (default 2)
+            
+        Returns:
+            Label: "Bullish", "Bearish", or "Neutral"
+            Offset: Number of days until regime ends
+        """
+        if len(future_prices) < min_days + 1:
+            return "Neutral", len(future_prices)-1
+        
+        # Only consider prices from min_days onwards for barrier hits
+        relevant_prices = future_prices[min_days:]
+        
+        if len(relevant_prices) == 0:
+            return "Neutral", len(future_prices)-1
+        
+        # Check barrier hits
+        hit_upper = np.any(relevant_prices >= upper_barrier)
+        hit_lower = np.any(relevant_prices <= lower_barrier)
+        
+        if hit_upper and hit_lower:
+            up_idx = np.argmax(relevant_prices >= upper_barrier)
+            lo_idx = np.argmax(relevant_prices <= lower_barrier)
+            lbl    = "Bullish" if up_idx < lo_idx else "Bearish"
+            off    = min(up_idx, lo_idx) + min_days
+        elif hit_upper:
+            lbl, off = "Bullish", np.argmax(relevant_prices >= upper_barrier) + min_days
+        elif hit_lower:
+            lbl, off = "Bearish", np.argmax(relevant_prices <= lower_barrier) + min_days
+        else:
+            lbl, off = "Neutral", len(future_prices)-1
+        return lbl, off
 
     # ------------------------------------------------------------------
     def _optimize_params(self, daily_window: pd.DataFrame) -> tuple[float, float, int]:
@@ -585,48 +637,45 @@ class MarketLabelerTBL:
 
 class MarketFeatureGenerator:
     """
-    Causal feature generator: fits on training prices only,
-    then for any df returns the per-timestep 'Previous Label'
-    using only past data.
-    """
-    def __init__(self, cfg_path: str = "config.yaml"):
-        self.tbl = MarketLabelerTBL(cfg_path)
+    Causal "previous-regime" feature.
 
-    def fit(self, train_df: pd.DataFrame) -> None:
-        """Fit thresholds on training price history."""
-        self.tbl._fit_thresholds(train_df)
+    For every tweet we return the label of the **last completed regime**,
+    i.e. the most recent window whose barrier had already closed strictly
+    before the tweet's date.  Works fold-locally, needs no global state and
+    never peeks into the future → leakage-free.
+    """
+    def fit(self, *_):                 # nothing to learn – stateless
+        return self
 
     def transform(self, df: pd.DataFrame) -> pd.Series:
-        """Apply per-timestep labeling (no future leak) and return causal Previous Label."""
-        # ── 1. Label every tweet with current regime (already no-leak) ──
-        labeled   = self.tbl._apply_labels_with_fitted_thresholds(df.copy())
+        if "Barrier End Date" not in df.columns:
+            raise ValueError("Run MarketLabelerTBL before generating features")
 
-        # choose a proper date column
-        date_col  = "date" if "date" in labeled.columns else "Tweet Date"
-        labeled["__day"] = pd.to_datetime(labeled[date_col]).dt.normalize()
-
-        # ── 2. Collapse to one label per trading day ─────────────────────
-        daily_lbl = (
-            labeled.groupby("__day")["Label"].first()   # one label per day
+        ordered = (
+            df[["Tweet Date", "Barrier End Date", "Label"]]
+              .sort_values("Tweet Date")
+              .reset_index()
         )
 
-        # ── 3. Build "previous-regime": majority label over the *last Vₜ* days
-        vt   = self.tbl.cfg.vt_grid[0]               # use same Vₜ as labeler
-        code = {"Bearish": 0, "Neutral": 1, "Bullish": 2}
-        inv  = {v: k for k, v in code.items()}
-
-        # numeric codes → rolling majority (fast) → back to strings
-        prev_regime = (
-            daily_lbl.map(code)                                # string → int
-                     .rolling(window=vt, min_periods=1)
-                     .apply(lambda x: np.bincount(x.astype(int)).argmax(),
-                            raw=True)
-                     .shift(1)                                  # strictly causal
-                     .fillna(code["Neutral"]).astype(int)
-                     .map(inv)                                  # int → string
+        # collect all barrier-closing events first
+        events = (
+            ordered[["Barrier End Date", "Label"]]
+              .dropna()
+              .drop_duplicates()
+              .sort_values("Barrier End Date")
+              .itertuples(index=False, name=None)
         )
+        events = list(events)
+        ev_ptr = 0
+        last_lbl = "Neutral"
+        prev_labels = []
 
-        # map back to each tweet on that day
-        labeled["PrevRegime"] = labeled["__day"].map(prev_regime)
+        for _, row in ordered.iterrows():
+            today = row["Tweet Date"].normalize()
+            while ev_ptr < len(events) and events[ev_ptr][0] < today:
+                last_lbl = events[ev_ptr][1]
+                ev_ptr  += 1
+            prev_labels.append(last_lbl)
 
-        return labeled["PrevRegime"]
+        out = pd.Series(prev_labels, index=ordered["index"])
+        return out.reindex(df.index).fillna("Neutral")

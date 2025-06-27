@@ -114,12 +114,8 @@ class EvalLoaderComplete:
         print(f"✅ Eb label distribution: {eb_df['Label'].value_counts().to_dict()}")
         print(f"✅ Eb event distribution: {eb_df['Is_Event'].value_counts().to_dict()}")
         
-        # 5. Time-series splits (grouped by temporal proximity)
-        print("\n" + "="*50)
-        print("CREATING GROUPED TIME-SERIES SPLITS")
-        print("="*50)
-        ea_train_folds, ea_test_folds = self._create_time_folds(ea_df, n_folds)
-        eb_train_folds, eb_test_folds = self._create_time_folds(eb_df, n_folds)
+        # 5. *Skip* CV fold generation when we are reproducing the paper setup
+        ea_train_folds, ea_test_folds, eb_train_folds, eb_test_folds = [], [], [], []
         # Val dataset is kept whole for stress testing (no folds)
         
         print(f"✅ Ea fold sizes - train: {[len(f) for f in ea_train_folds]}")
@@ -139,23 +135,16 @@ class EvalLoaderComplete:
         self._validate_paper_compliance(ea_df, val_df, eb_df, all_data)
         
         return {
-            "ea_train_folds": ea_train_folds,
-            "ea_test_folds":  ea_test_folds,
-            "eb_train_folds": eb_train_folds,
-            "eb_test_folds":  eb_test_folds,
-            "ea_full":        ea_df,
-            "val_full":       val_df,
-            "eb_full":        eb_df,
-            "all_data":       all_data
+            "ea_full": ea_df,
+            "eb_full": eb_df
         }
 
     def _create_ea_dataset(self, df_labeled):
         """
-        Create Ea dataset: 2019-2020 data with ~90k tweets evenly distributed across labels.
-        Target: ~30k each of Bullish/Bearish/Neutral (or proportional if insufficient).
+        Create Ea dataset **exactly as in the paper**: *only year-2020*
+        (~60 000 tweets, balanced across 3 classes).
         """
-        # Filter for 2019-2020
-        ea = df_labeled[df_labeled['date'].dt.year.isin([2019, 2020])].copy()
+        ea = df_labeled[df_labeled['date'].dt.year == 2020].copy()
         print(f"2019-2020 data available: {len(ea)} tweets")
         
         # Drop rows with missing labels
@@ -167,7 +156,7 @@ class EvalLoaderComplete:
         print(f"Available labels in 2019-2020: {label_counts.to_dict()}")
         
         # Determine sampling strategy based on availability
-        total_target = 90_000    # ≈30k per class
+        total_target = 60_000    # ≈20k per class
         min_available = label_counts.min()
         
         if min_available * 3 >= total_target:
@@ -209,13 +198,12 @@ class EvalLoaderComplete:
 
     def _create_eb_dataset(self, df_labeled):
         """
-        Create Eb dataset: 2015-2018 & 2022-2023 data, event-focused.
-        Target: up to 25k event tweets + fill to ~40k with non-event tweets.
+        Create Eb as described in the paper:
+        2015-2019  *plus* 2021-2023  (2020 is excluded because it is Ea).
         """
-        # Filter for 2015-2018 & 2022-2023 (exclude Ea years 2019-2020 and Val year 2021)
         eb = df_labeled[
-            ((df_labeled['date'].dt.year >= 2015) & (df_labeled['date'].dt.year <= 2018)) |
-            ((df_labeled['date'].dt.year >= 2022) & (df_labeled['date'].dt.year <= 2023))
+            ((df_labeled['date'].dt.year >= 2015) & (df_labeled['date'].dt.year <= 2019)) |
+            ((df_labeled['date'].dt.year >= 2021) & (df_labeled['date'].dt.year <= 2023))
         ].copy()
         print(f"2015-2018 & 2022-2023 data available: {len(eb)} tweets")
         
