@@ -118,7 +118,8 @@ class SingleTrainer:
             df_prep = pre.transform(df.copy())
 
         # ---------- 2  EWMA-TBL labelling ------------------------------------
-        lbl = MarketLabelerTBL(self.cfg_path)
+        lbl = MarketLabelerTBL(self.cfg_path,           # show bar if not quiet
+                               verbose=not self.quiet)
         if fit_preproc_on is None:              # fit on EA only
             df_lab = lbl.fit_and_label(df_prep)
             self._labeler = lbl
@@ -191,7 +192,8 @@ class SingleTrainer:
             (labels == "Bullish").sum()
         ], dtype=torch.float32, device=self.device)
         # weight_k = (1 / f_k)  ⋅  (mean(f))
-        class_weight = (1.0 / cls_freq) * (cls_freq.mean())
+        inv = 1.0 / cls_freq
+        class_weight = (inv / inv.mean()).sqrt().clamp(max=1.6)   # √-inv, capped
 
         # helper so the training loop stays a one-liner
         def ce_loss(logits, targets, weight, smoothing=0.05):
