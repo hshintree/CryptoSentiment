@@ -23,10 +23,18 @@ eb = _coerce_dates(eb)
 print(f"EA rows: {len(ea):,}  EB rows: {len(eb):,}")
 
 # 2 ── model + trainer -------------------------------------------------------
-cfg = yaml.safe_load(open(CFG))
-mdl = Model(cfg["model"])
+cfg  = yaml.safe_load(open(CFG))
+mdl  = Model(cfg["model"])
 
-trainer = SingleTrainer(mdl, CFG, quiet=False)
+# ── pick best device automatically ─────────────────────────────────
+best_device = (
+    "cuda" if torch.cuda.is_available()
+    else "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+    else "cpu"
+)
+print(f"🖥️  Using device: {best_device}")
+
+trainer = SingleTrainer(mdl, CFG, device=best_device, quiet=False)
 trainer.lr = 2e-5                          # then patch (works)
 trainer.epochs = 3
 trainer.warmup_frac = 0.20

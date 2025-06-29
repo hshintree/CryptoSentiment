@@ -17,13 +17,20 @@ CKPTS     = Path("models/ensemble"); CKPTS.mkdir(parents=True, exist_ok=True)
 
 cfg = yaml.safe_load(open(CFG))
 
+# ── pick best device automatically ─────────────────────────────────
+best_device = (
+    "cuda" if torch.cuda.is_available()
+    else "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+    else "cpu"
+)
+
 # ---------- train & save -------------------------------------------------
 for s in SEEDS:
     print(f"\n🕒  {datetime.now():%H:%M:%S}  — seed {s} starting")
 
     torch.manual_seed(s);  np.random.seed(s)
     m = Model(cfg["model"])
-    t = SingleTrainer(m, CFG, quiet=True)
+    t = SingleTrainer(m, CFG, device=best_device, quiet=True)
     t.lr = 2e-5; t.epochs = 3; t.warmup_frac = 0.20
     t.fit(EA)
     save_model(m, CKPTS / f"seed{s}")
@@ -32,7 +39,11 @@ for s in SEEDS:
 
 # ---------- inference ----------------------------------------------------
 models  = load_ensemble(CKPTS, CFG)
-helper  = SingleTrainer(Model(cfg["model"]), CFG, quiet=False)  # only for pipeline
+helper = SingleTrainer(
+    Model(cfg["model"]), CFG,
+    device=best_device,
+    quiet=False,           # only for preprocessing/loader
+)
 
 print("\n=== ENSEMBLE RESULTS ===")
 predict_ensemble(models, EA, helper, name="EA-ens")

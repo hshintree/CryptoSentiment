@@ -13,6 +13,7 @@ import yaml
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
+import torch
 
 from preprocessor import Preprocessor
 from market_labeler_ewma import MarketLabelerTBL
@@ -96,9 +97,14 @@ print(f"\n⚙️  Setting up model and trainer...")
 with open(CFG) as f:
     cfg = yaml.safe_load(f)
 model_cfg = cfg["model"]
-model     = Model(model_cfg)
-trainer   = Trainer(model, ea, CFG)  # Pass EA data, preprocessing happens per-fold
-print(f"Using device: {trainer.device}")
+model       = Model(model_cfg)
+best_device = (
+    "cuda" if torch.cuda.is_available()
+    else "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+    else "cpu"
+)
+trainer     = Trainer(model, ea, CFG, quiet=False)  # Trainer prints its own device
+print(f"🖥️  Using device: {best_device}")
 
 # quick knobs before trainer.train()
 trainer.epochs        = 2          # ← from 2 → 3
