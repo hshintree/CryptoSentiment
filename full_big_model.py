@@ -35,10 +35,10 @@ best_device = (
 print(f"🖥️  Using device: {best_device}")
 
 trainer = SingleTrainer(mdl, CFG, device=best_device, quiet=False)
-trainer.lr = 2e-5                          # then patch (works)
-trainer.epochs = 3
-trainer.warmup_frac = 0.20
-# patch the already-built optimiser
+trainer.lr = 1e-5
+trainer.epochs = 2
+trainer.warmup_frac = 0.10
+# reflect LR in optimiser
 for g in trainer.optimizer.param_groups:
     g['lr'] = trainer.lr
 
@@ -63,4 +63,3 @@ save_model(mdl, Path("models")/f"single_{stamp}")
 with open(f"metrics_single_{stamp}.json","w") as f:
     import json, pprint; json.dump([res_ea,res_eb], f, indent=2)
 print("✓ metrics written")
-

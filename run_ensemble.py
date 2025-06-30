@@ -30,7 +30,7 @@ for s in SEEDS:
 
     torch.manual_seed(s);  np.random.seed(s)
     m = Model(cfg["model"])
-    t = SingleTrainer(m, CFG, device=best_device, quiet=True)
+    t = SingleTrainer(m, CFG, device=best_device, quiet=False)
     t.lr = 2e-5; t.epochs = 3; t.warmup_frac = 0.20
     t.fit(EA)
     save_model(m, CKPTS / f"seed{s}")

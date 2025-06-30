@@ -26,7 +26,7 @@ data:
     lemmatization: true
 model:
   type: "CryptoBERT"           # CryptoBERT ≡ BERTweet maybe FinBERT
-  pretrained_name: "vinai/bertweet-base"
+  pretrained_name: "ElKulako/cryptobert"
   prompt_tuning: true          # Use prompt-tuning instead of fine-tuning
   prompt_length: 10            # Number of learnable prompt tokens
 backtesting:

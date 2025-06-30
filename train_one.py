@@ -18,7 +18,7 @@ from tqdm import tqdm
 from sklearn.metrics import accuracy_score, confusion_matrix, \
                              precision_recall_fscore_support
 
-from transformers import get_linear_schedule_with_warmup
+from transformers import get_cosine_schedule_with_warmup
 from torch.utils.data import DataLoader, Dataset
 from torch import nn
 
@@ -78,8 +78,9 @@ class SingleTrainer:
 
         # training hp – reuse values from YAML ----------------------------------
         tcfg               = self.config["training"]
-        self.lr            = float(tcfg.get("learning_rate", 2e-5))
-        self.epochs        = int  (tcfg.get("epochs",        3))
+        # solo-run defaults (can still be overridden later)
+        self.lr            = float(tcfg.get("learning_rate", 3e-5))
+        self.epochs        = int  (tcfg.get("epochs",        5))
         self.batch_size    = int  (tcfg.get("batch_size",   12))
         self.warmup_frac   = float(tcfg.get("warmup_steps", 0.2))
 
@@ -177,10 +178,11 @@ class SingleTrainer:
         val_loader   = self._make_loader(train_proc, shuffle=False)  # same data, no shuffle
         
         tot_steps = len(train_loader) * self.epochs
-        sched = get_linear_schedule_with_warmup(
+        sched = get_cosine_schedule_with_warmup(
             self.optimizer,
-            int(tot_steps * self.warmup_frac),
-            tot_steps
+            num_warmup_steps=int(tot_steps * self.warmup_frac),
+            num_training_steps=tot_steps,
+            num_cycles=0.5              # one warm restart halfway
         )
         
         # ---------- weighted CE + 0.05 label-smoothing ---------------------------
@@ -195,12 +197,14 @@ class SingleTrainer:
         inv = 1.0 / cls_freq
         class_weight = (inv / inv.mean()).sqrt().clamp(max=1.6)   # √-inv, capped
 
-        # helper so the training loop stays a one-liner
-        def ce_loss(logits, targets, weight, smoothing=0.05):
-            return torch.nn.functional.cross_entropy(
-                logits, targets,
-                weight=weight,
-                label_smoothing=smoothing)
+        # ---------- class-balanced focal-loss helper -------------------------
+        def focal_loss(logits, targets, weight, gamma=1.5):
+            logp = torch.nn.functional.log_softmax(logits, dim=-1)
+            p_t  = logp.exp()
+            ce   = torch.nn.functional.nll_loss(
+                       logp, targets, weight=weight, reduction='none')
+            focal = ((1 - p_t.gather(1, targets.unsqueeze(1)).squeeze())**gamma) * ce
+            return focal.mean()
 
         self.model.bert_model.train()
         for epoch in range(1, self.epochs + 1):
@@ -215,7 +219,7 @@ class SingleTrainer:
                                             if k in ("input_ids","attention_mask")})
 
                 # ----- training loop -----
-                loss = ce_loss(logits, lbls, class_weight, smoothing=0.05)
+                loss = focal_loss(logits, lbls, class_weight, gamma=1.5)
 
                 loss.backward()
                 self.optimizer.step();  sched.step();  self.optimizer.zero_grad()

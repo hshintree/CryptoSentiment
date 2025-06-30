@@ -106,6 +106,9 @@ class Preprocessor:
         if {'RSI','ROC'}.issubset(data.columns):
             self.scaler = MinMaxScaler().fit(data[['RSI','ROC']])
             data[['RSI','ROC']] = self.scaler.transform(data[['RSI','ROC']])
+            print("🟢  Preprocessor: scaled RSI∈[%.3f,%.3f]  ROC∈[%.3f,%.3f]" %
+              (data['RSI'].min(), data['RSI'].max(),
+               data['ROC'].min(), data['ROC'].max()))
         return data
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:

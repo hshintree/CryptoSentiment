@@ -18,7 +18,7 @@ import torch
 from preprocessor import Preprocessor
 from market_labeler_ewma import MarketLabelerTBL
 from model import Model
-from trainer import Trainer, cross_val_predict
+from trainer import Trainer
 from sklearn.metrics import (accuracy_score,
                              precision_recall_fscore_support)
 from glob import glob
@@ -107,8 +107,10 @@ trainer     = Trainer(model, ea, CFG, quiet=False)  # Trainer prints its own dev
 print(f"🖥️  Using device: {best_device}")
 
 # quick knobs before trainer.train()
-trainer.epochs        = 2          # ← from 2 → 3
-trainer.learning_rate = 1e-5       
+trainer.epochs        = 3          # ← from 2 → 3
+trainer.learning_rate = 2e-5  
+trainer.batch_size = 12
+trainer.warmup_frac = .1     
 # If you switch to prompt-tuning / last-layer-only:
 # trainer.learning_rate = 8e-5
 
@@ -154,23 +156,8 @@ print(f"="*70)
 if trainer.fold_states:
     print("🔮 Generating predictions on EB evaluation set…")
     
-    # Preprocess and label EB data for prediction
-    print("  📊 Preprocessing EB data...")
-    from preprocessor import Preprocessor
-    pred_preprocessor = Preprocessor(CFG)
-    pred_preprocessor.fit(ea)           # fit on training only
-    eb_prep  = pred_preprocessor.transform(eb.copy())
-    
-    # ⚠️  Do NOT relabel Eb – keep its ground-truth labels.
-    eb_prep  = eb_prep.rename(columns={"date": "Tweet Date"})
-    # add causal Previous-Label feature once (uses past values only)
-    from market_labeler_ewma import MarketFeatureGenerator
-    feat_gen = MarketFeatureGenerator(CFG)
-    feat_gen.fit(eb_prep)
-    eb_prep["Previous Label"] = feat_gen.transform(eb_prep)
-    
-    print(f"  🎯 Running cross-validation prediction on {len(eb_prep):,} EB tweets…")
-    sig_eb = cross_val_predict(trainer, eb_prep)
+    print(f"  🎯 Running softmax-averaged ensemble on {len(eb):,} EB tweets…")
+    sig_eb = trainer.ensemble_predict(eb, weighted=True)
     
     # Save per-tweet predictions
     sig_eb.to_csv("signals_eb.csv", index=False)
@@ -216,6 +203,59 @@ if trainer.fold_states:
             print("  ✅ Good performance on out-of-sample data")
         else:
             print("  📈 Moderate performance - may need model improvements")
+    
+    # ── 6.5. ALSO test on EA (in-sample) ─────────────────────────────
+    print(f"\n" + "="*70)
+    print(f"🔮 IN-SAMPLE EVALUATION ON EA (2020 training data)")
+    print(f"="*70)
+    
+    print(f"  🎯 Running softmax-averaged ensemble on {len(ea):,} EA tweets…")
+    sig_ea = trainer.ensemble_predict(ea, weighted=True)
+    
+    # Save per-tweet predictions for EA
+    sig_ea.to_csv("signals_ea.csv", index=False)
+    print("✓ Saved per-tweet predictions → signals_ea.csv")
+    
+    # Generate daily signals via majority vote for EA
+    print("  📅 Aggregating daily signals...")
+    daily_ea = (
+        sig_ea.groupby("Tweet Date").Pred_Label
+        .agg(lambda x: x.value_counts().idxmax())
+        .sort_index()
+        .rename("Daily_Signal")
+    )
+    daily_ea.to_csv("ea_daily_signals.csv")
+    print("✓ Saved per-day signals     → ea_daily_signals.csv")
+    
+    # Summary statistics for EA
+    ea_pred_dist    = sig_ea['Pred_Label'].value_counts()
+    daily_ea_pred_dist = daily_ea.value_counts()
+    print(f"\n📊 EA Prediction Summary:")
+    print(f"  Per-tweet predictions: {dict(ea_pred_dist)}")
+    print(f"  Daily signals:        {dict(daily_ea_pred_dist)}")
+    
+    # Performance hint for EA
+    if 'Label' in sig_ea.columns:
+        # --- core metrics -------------------------------------------------
+        y_true = sig_ea['Label'].map({'Bearish':0,'Neutral':1,'Bullish':2}).values
+        y_pred = sig_ea['Pred_Label'].map({'Bearish':0,'Neutral':1,'Bullish':2}).values
+
+        acc  = accuracy_score(y_true, y_pred)
+        prec, rec, f1, _ = precision_recall_fscore_support(
+            y_true, y_pred, average="macro", zero_division=0)
+
+        print(f"  Accuracy : {acc:.3f}")
+        print(f"  Precision: {prec:.3f}")
+        print(f"  Recall   : {rec:.3f}")
+        print(f"  F1-score : {f1:.3f}")
+
+        # --------- quick leakage sanity check ----------------------------
+        if acc > 0.90:
+            print("  ⚠️  Very high accuracy - check for data leakage!")
+        elif acc > 0.60:
+            print("  ✅ Good performance on in-sample data")
+        else:
+            print("  📈 Moderate performance - may need model improvements")
 else:
     print("⚠️  No trained models – skipping EB inference")
 
@@ -224,7 +264,9 @@ print(f"🎉 FULL CV RUN COMPLETED!")
 print(f"="*70)
 print(f"📁 Files generated:")
 print(f"  • Model checkpoints: models/ea_2019-2020_{timestamp}/")
+print(f"  • EA  predictions: signals_ea.csv")
+print(f"  • EA  daily signals: ea_daily_signals.csv")
 print(f"  • EB  predictions: signals_eb.csv")
-print(f"  • Daily signals:   eb_daily_signals.csv")
+print(f"  • EB  daily signals: eb_daily_signals.csv")
 print(f"  • Training metrics: training_metrics.json")
 print(f"\n✅ Ready for paper results analysis!") 
