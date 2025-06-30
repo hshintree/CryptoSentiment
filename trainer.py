@@ -1,7 +1,6 @@
 import os
 # enable MPS→CPU fallback for any unsupported kernels
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # trainer.py  — hot-fix: ensure numeric hyper-parameters are cast to float/int
 import yaml
@@ -603,11 +602,14 @@ class Trainer:
     def _make_loader(self, df: pd.DataFrame, *, shuffle: bool) -> DataLoader:
         feats, lbls = [], []
         for _, row in df.iterrows():
+            # Ensure ROC_bucket is available - use "neutral" as fallback if missing
+            roc_bucket = row.get("ROC_bucket", "neutral")
             tok = self.model.preprocess_input(
                 tweet_content=row["Tweet Content"],
-                rsi=row["RSI"],
-                roc=row["ROC"],
+                rsi=row["RSI_raw"],
+                roc=row["ROC_raw"],
                 previous_label=row["Previous Label"],
+                roc_bucket=roc_bucket,
             )
             # Remove token_type_ids and keep other tensors as is
             if "token_type_ids" in tok:
@@ -677,8 +679,8 @@ class Trainer:
                 print(" BATCH KEYS:", batch.keys())
                 print("  input_ids  max id:", batch["input_ids"].max().item())
                 print("  input_ids  shape:", batch["input_ids"].shape)
-                print("DEBUG prompt example:",
-                    self.model.tokenizer.decode(batch["input_ids"][0, :60]))
+                print("Prompt example:",
+                    self.model.tokenizer.decode(batch["input_ids"][0, :100]))
                 # If you have an attention_mask, print its dtype & shape:
                 if "attention_mask" in batch:
                     print("  attn_mask shape:", batch["attention_mask"].shape)
@@ -953,15 +955,17 @@ class Trainer:
 #                 # so we can pick by position instead of worrying about the space/underscore
 #                 # ------------------------------------------------------------------
 #                 tweet_txt      = row[va_df.columns.get_loc("Tweet Content")]
-#                 rsi_val        = row[va_df.columns.get_loc("RSI")]
-#                 roc_val        = row[va_df.columns.get_loc("ROC")]
+#                 rsi_val        = row[va_df.columns.get_loc("RSI_raw")]
+#                 roc_val        = row[va_df.columns.get_loc("ROC_raw")]
 #                 prev_lbl       = row[va_df.columns.get_loc("Previous Label")]
+#                 roc_bucket_val = row[va_df.columns.get_loc("ROC_bucket")] if "ROC_bucket" in va_df.columns else "neutral"
 
 #                 tok = model.preprocess_input(
 #                     tweet_content=tweet_txt,
 #                     rsi=rsi_val,
 #                     roc=roc_val,
 #                     previous_label=prev_lbl,
+#                     roc_bucket=roc_bucket_val,
 #                 )
 #                 tok.pop("token_type_ids", None)
 #                 tok = {k: v.to(device) for k, v in tok.items()}
@@ -993,4 +997,4 @@ class Trainer:
 #         })
 #         out.loc[list(cnf.keys()), "Pred_Conf"]  = pd.Series(cnf)
 
-#     return out
+    # return out

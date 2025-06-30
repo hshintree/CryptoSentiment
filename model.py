@@ -25,9 +25,11 @@ class Model:
         self.use_prompt_tuning = params.get("prompt_tuning", True)
 
         if self.model_type == "CryptoBERT":
-            ckpt = "vinai/bertweet-base"
+            ckpt = "ElKulako/cryptobert"
+            print(f"🔹 Loading checkpoint ➜ {ckpt}")
         elif self.model_type == "FinBERT":
             ckpt = "yiyanghkust/finbert-tone"
+            print(f"🔹 Loading checkpoint ➜ {ckpt}")
         else:
             raise ValueError("Unsupported model type – choose CryptoBERT or FinBERT")
 
@@ -78,20 +80,34 @@ class Model:
         roc: float,
         previous_label: str,
         log_volume: float | None = None,
+        roc_bucket: str,
     ) -> dict:
         """
         Tokenise pure text prompt including all numeric features as text.
         No separate numeric_features tensor - everything goes through text.
+        Uses dynamic ROC bucketing exclusively - no fixed constants.
         """
         # Include volume info in prompt if available
         volume_info = ""
         if log_volume is not None:
             volume_info = f" | Vol(log):{log_volume:.2f}"
             
-        # Pure text prompt with all features as readable text
+        # --- indicator → categorical token ------------------------------------
+        def _bucket_rsi(val: float) -> str:
+            # paper uses 30/70 thresholds
+            if val >= 70:   return "bullish"
+            if val <= 30:   return "bearish"
+            return "neutral"
+
+        rsi_desc = _bucket_rsi(rsi)
+        # Use dynamic bucket exclusively - no fallback to fixed constants
+        roc_desc = roc_bucket
+
         prompt = (
-            f"Prev:{previous_label} | "
-            f"ROC:{roc:.4f} | RSI:{rsi:.2f}{volume_info} | Tweet:{tweet_content}"
+            f"Previous Label: {previous_label}, "
+            f"ROC: {roc_desc}, "
+            f"RSI: {rsi_desc}{volume_info}, "
+            f"Tweet: {tweet_content}"
         )
         
         # Tokenize prompt and let HF handle positions & truncation at 128

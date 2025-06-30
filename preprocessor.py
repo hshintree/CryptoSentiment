@@ -72,11 +72,13 @@ class Preprocessor:
         ## 2) Technical indicators
         if 'Close' in data.columns:
             delta = data['Close'].diff(1)
-            gain = delta.clip(lower=0).rolling(window=14).mean()
-            loss = (-delta).clip(lower=0).rolling(window=14).mean()
-            rs = gain / loss
-            data['RSI'] = 100 - (100 / (1 + rs))
-            data['ROC'] = (
+            gain  = delta.clip(lower=0).rolling(window=14).mean()
+            loss  = (-delta).clip(lower=0).rolling(window=14).mean()
+            rs    = gain / loss
+
+            # keep the **raw** 0‒100 RSI / %ROC that the paper discretises
+            data['RSI_raw'] = 100 - (100 / (1 + rs))
+            data['ROC_raw'] = (
                 data['Close']
                     .pct_change(periods=self.roc_window_length)
                     .mul(100)
@@ -89,13 +91,26 @@ class Preprocessor:
         # Only forward-fill (propagate past into future), no backward-fill
         data = data.ffill()
         # Fill any initial NaNs in RSI/ROC with neutral defaults (no leakage)
-        if 'RSI' in data.columns:
+        if 'RSI_raw' in data.columns:
             neutral_rsi = sum(self.rsi_threshold) / 2  # midpoint between thresholds, e.g. 50
-            data['RSI'] = data['RSI'].fillna(neutral_rsi)
-        if 'ROC' in data.columns:
-            data['ROC'] = data['ROC'].fillna(0.0)
+            data['RSI_raw'] = data['RSI_raw'].fillna(neutral_rsi)
+        if 'ROC_raw' in data.columns:
+            data['ROC_raw'] = data['ROC_raw'].fillna(0.0)
         # Zero out any other residual NaNs (e.g. log_volume) safely
         data = data.fillna(0)
+        
+        ## 5) Dynamic ROC bucketing
+        if 'ROC_raw' in data.columns:
+            def _bucketise_roc(roc_series, window=8):
+                rolling_std = roc_series.rolling(window).std()
+                upper =  rolling_std
+                lower = -rolling_std
+                bucket = np.where(roc_series >  upper, "rising",
+                         np.where(roc_series < lower, "falling", "neutral"))
+                return bucket
+            
+            data['ROC_bucket'] = _bucketise_roc(data['ROC_raw'])
+        
         return data
 
     # ⚠️ removed def preprocess to avoid accidental global scaling
@@ -103,12 +118,12 @@ class Preprocessor:
     def fit(self, df: pd.DataFrame) -> pd.DataFrame:
         """Fit the RSI/ROC scaler on df, return scaled df."""
         data = self._compute_indicators(df)
-        if {'RSI','ROC'}.issubset(data.columns):
-            self.scaler = MinMaxScaler().fit(data[['RSI','ROC']])
-            data[['RSI','ROC']] = self.scaler.transform(data[['RSI','ROC']])
-            print("🟢  Preprocessor: scaled RSI∈[%.3f,%.3f]  ROC∈[%.3f,%.3f]" %
-              (data['RSI'].min(), data['RSI'].max(),
-               data['ROC'].min(), data['ROC'].max()))
+        # scale *copies* so you can still access the raw values later
+        if {'RSI_raw', 'ROC_raw'}.issubset(data.columns):
+            self.scaler = MinMaxScaler().fit(data[['RSI_raw', 'ROC_raw']])
+            data[['RSI', 'ROC']] = self.scaler.transform(
+                data[['RSI_raw', 'ROC_raw']]
+            )
         return data
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -116,7 +131,7 @@ class Preprocessor:
         if self.scaler is None:
             raise RuntimeError("Must call fit() before transform()")
         data = self._compute_indicators(df)
-        data[['RSI','ROC']] = self.scaler.transform(data[['RSI','ROC']])
+        data[['RSI', 'ROC']] = self.scaler.transform(data[['RSI_raw', 'ROC_raw']])
         return data
 
     def fit_transform(self, df: pd.DataFrame) -> pd.DataFrame:
