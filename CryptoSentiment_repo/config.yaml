@@ -5,19 +5,19 @@ training:
   optimizer: AdamW
   warmup_steps: 0.1  # 10% of total training steps
 data:
-  bitcoin_events_path: "/Users/hakeemshindy/Downloads/bitcoin_events.csv"  
+  bitcoin_events_path: "/Users/hakeemshindy/Downloads/bitcoin_event.csv"  
   # Kaggle tweets (point at the folder containing your two CSVs)
-  kaggle_dataset_dir: "/Users/hakeemshindy/Downloads/kaggle_tweet" 
+  kaggle_dir: "/Users/hakeemshindy/Downloads/kaggle_tweet" 
 
   output_data_path: "/Users/hakeemshindy/Desktop/CryptoSentiment/CryptoSentiment_repo/data/output"  # Path to save processed data
   prebit_dataset_path: null  # Combined dataset from Kaggle
 
-  prebit_dataset_dir: "/Users/hakeemshindy/Downloads/prebit_dir"  # Directory with yearly CSVs
+  prebit_dir: "/Users/hakeemshindy/Downloads/prebit_dir"  # Directory with yearly CSVs
 
   price_label_path:   "/Users/hakeemshindy/Downloads/btc_price/price_label.csv"
 
   rsi_threshold: [30, 70]
-  roc_window_length: 8  # Assuming based on text
+  roc_window_length: 12  # Assuming based on text
   preprocessing_steps:
     text_normalization: true
     remove_urls: true
@@ -26,9 +26,9 @@ data:
     lemmatization: true
 model:
   type: "CryptoBERT"           # CryptoBERT ≡ BERTweet maybe FinBERT
-  pretrained_name: "vinai/bertweet-base"
-  freeze_layers: 11            # freeze first 11 transformer blocks
-  prompt_tuning: true
+  pretrained_name: "ElKulako/cryptobert"
+  prompt_tuning: true          # Use prompt-tuning instead of fine-tuning
+  prompt_length: 10            # Number of learnable prompt tokens
 backtesting:
   using_library: "vectorbt"
 evaluation:
@@ -44,9 +44,18 @@ signal_generation:
 market_labeling:
   strategy: "TBL"  # Triple Barrier Labeling strategy
   barrier_window: 8-15  # Specified in paper
-  upper_vol_mult: 1.0  # Volatility multiplier for upper barrier
-  lower_vol_mult: 1.0  # Volatility multiplier for lower barrier
-  fu_grid: [0.03, 0.05, 0.07]
-  fl_grid: [0.03, 0.05, 0.07]
-  vt_grid: [5, 10]
+  # ─── CONSERVATIVE BARRIERS (more Neutral) ──────────────
+  # • 1.4–2.2 × σ ≈ 12–20 % BTC move when σ30 ≈ 9–10 %
+  # • Keeps the same 8–12 day look-ahead the paper proved profitable
+  fu_grid: [1.4, 1.6, 1.8, 2.2]     # Upper barrier multipliers
+  fl_grid: [1.4, 1.6, 1.8, 2.2]     # Lower barrier multipliers
+  vt_grid: [8, 10, 12]              # Days to give the move time
+
+  # Leave EWMA look-back at 8 days so σ remains comparable
+  ewma_tau: 8
+
+  # Minimum bars in time before a hit counts (unchanged)
+  min_trend_days: 2
+
+  # Re-optimise every ~6 months (126 trading days)
   rebalance_days: 126

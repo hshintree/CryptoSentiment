@@ -1,4 +1,4 @@
 import pandas as pd
 
-df = pd.read_csv("signals_per_tweet.csv")
-print(df["Pred_Label"].value_counts())
+df = pd.read_csv("data/labeled_test.csv")
+print(df["Label"].value_counts())
