@@ -13,11 +13,13 @@ import yaml
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
+import torch
+import os
 
 from preprocessor import Preprocessor
 from market_labeler_ewma import MarketLabelerTBL
 from model import Model
-from trainer import Trainer, cross_val_predict
+from trainer import Trainer
 from sklearn.metrics import (accuracy_score,
                              precision_recall_fscore_support)
 from glob import glob
@@ -63,6 +65,72 @@ eb["Tweet Date"] = pd.to_datetime(eb["Tweet Date"], errors="coerce")
 print(f"EB  columns after strip: {eb.columns.tolist()}")
 print(f"EB  rows: {len(eb):,} tweets")
 
+# ── 1 bis.  EA-only indicator diagnostics (paper Table 3 style) ─────────
+print("\n🔍 Paper-style indicator correlations **on EA (2020)**")
+
+# ➊ technical indicators & buckets
+pre_ea  = Preprocessor(CFG)
+ea_proc = pre_ea.fit_transform(ea.copy())          # adds RSI_raw / ROC_raw
+
+# ➋ daily aggregation (mean indicators, first label)
+_code = {"Bearish": 0, "Neutral": 1, "Bullish": 2}
+daily_ea = (
+    ea_proc
+      .groupby(ea_proc["Tweet Date"].dt.normalize())
+      .agg({"RSI_raw": "mean",
+            "ROC_raw": "mean",
+            "Label":   "first"})
+      .replace(_code)
+)
+
+# ➌ Pearson ρ (numeric indicators ↔ label)
+pear = daily_ea.corr().iloc[:-1, -1]     # each feature vs ground-truth label
+for feat, rho in pear.items():
+    print(f"   ρ({feat:14s} , Label) = {rho:+.3f}")
+
+# ➍ Chi-square association (bucket ↔ label, 3 × 3 contingency)
+from scipy.stats import chi2_contingency
+import numpy as np
+
+#   helper to bucketise into bearish/neutral/bullish (same as preprocessing)
+def _tri_bucket(series, thresh_lo=-np.inf, thresh_hi=np.inf):
+    """map numeric → {bearish,neutral,bullish}"""
+    cats = np.where(series < 0, "bearish",
+           np.where(series > 0, "bullish", "neutral"))
+    return pd.Series(cats, index=series.index)
+
+rsib = _tri_bucket(daily_ea["RSI_raw"] - 50)   # RSI centred at 50
+rocb = _tri_bucket(daily_ea["ROC_raw"])
+lbl  = daily_ea["Label"]
+
+for name, buckets in [("RSI_bucket", rsib), ("ROC_bucket", rocb)]:
+    tbl = pd.crosstab(buckets, lbl)
+    chi2, p, _, _ = chi2_contingency(tbl)
+    print(f"   χ²({name:11s}) = {chi2:6.1f}   p-value = {p:.4f}")
+
+print("─────────────────────────────────────────────────────────────")
+
+# # ── Paper-style indicator correlations on the *full* EB archive ──────────
+# print("\n🔍 Paper-style indicator correlations (daily aggregation on full EB)")
+# from preprocessor import Preprocessor
+
+# pre = Preprocessor(CFG)
+# eb_proc = pre.fit_transform(eb.copy())        # adds RSI_raw / ROC_raw
+
+# _code = {"Bearish": 0, "Neutral": 1, "Bullish": 2}
+# daily = (
+#     eb_proc
+#       .groupby(eb_proc["Tweet Date"].dt.normalize())
+#       .agg({"RSI_raw": "mean",
+#             "ROC_raw": "mean",
+#             "Label": "first"})
+#       .replace(_code)
+# )
+# corr = daily.corr().iloc[:-1, -1]   # each feature vs ground-truth label
+# for feat, rho in corr.items():
+#     print(f"   ρ({feat:14s} , Label) = {rho:+.3f}")
+# print("─────────────────────────────────────────────────────────────")
+
 # Verify temporal separation
 ea_years = sorted(ea['Tweet Date'].dt.year.unique())
 eb_years  = sorted(eb['Tweet Date'].dt.year.unique())
@@ -96,9 +164,28 @@ print(f"\n⚙️  Setting up model and trainer...")
 with open(CFG) as f:
     cfg = yaml.safe_load(f)
 model_cfg = cfg["model"]
-model     = Model(model_cfg)
-trainer   = Trainer(model, ea, CFG)  # Pass EA data, preprocessing happens per-fold
-print(f"Using device: {trainer.device}")
+
+# Enable MPS fallback for better compatibility
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
+model       = Model(model_cfg)
+best_device = (
+    "cuda" if torch.cuda.is_available()
+    else "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+    else "cpu"
+)
+print(f"🖥️  Detected device: {best_device}")
+
+# MPS-specific optimizations
+if best_device == "mps":
+    print("🚀 MPS detected - enabling optimizations:")
+    print("   • Single-worker DataLoader to avoid pickle issues")
+    print("   • File system sharing strategy")
+    print("   • Forced float32 precision")
+    torch.multiprocessing.set_sharing_strategy("file_system")
+    torch.set_default_dtype(torch.float32)
+
+trainer     = Trainer(model, ea, CFG, quiet=False)  # Trainer prints its own device
 
 # quick knobs before trainer.train()
 trainer.epochs        = 2          # ← from 2 → 3
@@ -148,23 +235,8 @@ print(f"="*70)
 if trainer.fold_states:
     print("🔮 Generating predictions on EB evaluation set…")
     
-    # Preprocess and label EB data for prediction
-    print("  📊 Preprocessing EB data...")
-    from preprocessor import Preprocessor
-    pred_preprocessor = Preprocessor(CFG)
-    pred_preprocessor.fit(ea)           # fit on training only
-    eb_prep  = pred_preprocessor.transform(eb.copy())
-    
-    # ⚠️  Do NOT relabel Eb – keep its ground-truth labels.
-    eb_prep  = eb_prep.rename(columns={"date": "Tweet Date"})
-    # add causal Previous-Label feature once (uses past values only)
-    from market_labeler_ewma import MarketFeatureGenerator
-    feat_gen = MarketFeatureGenerator(CFG)
-    feat_gen.fit(eb_prep)
-    eb_prep["Previous Label"] = feat_gen.transform(eb_prep)
-    
-    print(f"  🎯 Running cross-validation prediction on {len(eb_prep):,} EB tweets…")
-    sig_eb = cross_val_predict(trainer, eb_prep)
+    print(f"  🎯 Running softmax-averaged ensemble on {len(eb):,} EB tweets…")
+    sig_eb = trainer.ensemble_predict(eb, weighted=True)
     
     # Save per-tweet predictions
     sig_eb.to_csv("signals_eb.csv", index=False)
@@ -210,6 +282,59 @@ if trainer.fold_states:
             print("  ✅ Good performance on out-of-sample data")
         else:
             print("  📈 Moderate performance - may need model improvements")
+    
+    # ── 6.5. ALSO test on EA (in-sample) ─────────────────────────────
+    print(f"\n" + "="*70)
+    print(f"🔮 IN-SAMPLE EVALUATION ON EA (2020 training data)")
+    print(f"="*70)
+    
+    print(f"  🎯 Running softmax-averaged ensemble on {len(ea):,} EA tweets…")
+    sig_ea = trainer.ensemble_predict(ea, weighted=True)
+    
+    # Save per-tweet predictions for EA
+    sig_ea.to_csv("signals_ea.csv", index=False)
+    print("✓ Saved per-tweet predictions → signals_ea.csv")
+    
+    # Generate daily signals via majority vote for EA
+    print("  📅 Aggregating daily signals...")
+    daily_ea = (
+        sig_ea.groupby("Tweet Date").Pred_Label
+        .agg(lambda x: x.value_counts().idxmax())
+        .sort_index()
+        .rename("Daily_Signal")
+    )
+    daily_ea.to_csv("ea_daily_signals.csv")
+    print("✓ Saved per-day signals     → ea_daily_signals.csv")
+    
+    # Summary statistics for EA
+    ea_pred_dist    = sig_ea['Pred_Label'].value_counts()
+    daily_ea_pred_dist = daily_ea.value_counts()
+    print(f"\n📊 EA Prediction Summary:")
+    print(f"  Per-tweet predictions: {dict(ea_pred_dist)}")
+    print(f"  Daily signals:        {dict(daily_ea_pred_dist)}")
+    
+    # Performance hint for EA
+    if 'Label' in sig_ea.columns:
+        # --- core metrics -------------------------------------------------
+        y_true = sig_ea['Label'].map({'Bearish':0,'Neutral':1,'Bullish':2}).values
+        y_pred = sig_ea['Pred_Label'].map({'Bearish':0,'Neutral':1,'Bullish':2}).values
+
+        acc  = accuracy_score(y_true, y_pred)
+        prec, rec, f1, _ = precision_recall_fscore_support(
+            y_true, y_pred, average="macro", zero_division=0)
+
+        print(f"  Accuracy : {acc:.3f}")
+        print(f"  Precision: {prec:.3f}")
+        print(f"  Recall   : {rec:.3f}")
+        print(f"  F1-score : {f1:.3f}")
+
+        # --------- quick leakage sanity check ----------------------------
+        if acc > 0.90:
+            print("  ⚠️  Very high accuracy - check for data leakage!")
+        elif acc > 0.60:
+            print("  ✅ Good performance on in-sample data")
+        else:
+            print("  📈 Moderate performance - may need model improvements")
 else:
     print("⚠️  No trained models – skipping EB inference")
 
@@ -218,7 +343,9 @@ print(f"🎉 FULL CV RUN COMPLETED!")
 print(f"="*70)
 print(f"📁 Files generated:")
 print(f"  • Model checkpoints: models/ea_2019-2020_{timestamp}/")
+print(f"  • EA  predictions: signals_ea.csv")
+print(f"  • EA  daily signals: ea_daily_signals.csv")
 print(f"  • EB  predictions: signals_eb.csv")
-print(f"  • Daily signals:   eb_daily_signals.csv")
+print(f"  • EB  daily signals: eb_daily_signals.csv")
 print(f"  • Training metrics: training_metrics.json")
 print(f"\n✅ Ready for paper results analysis!") 

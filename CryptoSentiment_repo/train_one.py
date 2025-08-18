@@ -18,7 +18,7 @@ from tqdm import tqdm
 from sklearn.metrics import accuracy_score, confusion_matrix, \
                              precision_recall_fscore_support
 
-from transformers import get_linear_schedule_with_warmup
+from transformers import get_cosine_schedule_with_warmup
 from torch.utils.data import DataLoader, Dataset
 from torch import nn
 
@@ -51,10 +51,12 @@ class SingleTrainer:
     def __init__(self,
                  model: Model,
                  cfg_path: str = "config.yaml",
-                 device: str  | None = None) -> None:
+                 device: str  | None = None,
+                 quiet: bool = False) -> None:
 
         self.cfg_path = cfg_path
         self.config   = yaml.safe_load(open(cfg_path))
+        self.quiet    = quiet
 
         # device ----------------------------------------------------------------
         if device is not None:
@@ -76,7 +78,8 @@ class SingleTrainer:
 
         # training hp – reuse values from YAML ----------------------------------
         tcfg               = self.config["training"]
-        self.lr            = float(tcfg.get("learning_rate", 2e-5))
+        # solo-run defaults (can still be overridden later)
+        self.lr            = float(tcfg.get("learning_rate", 3e-5))
         self.epochs        = int  (tcfg.get("epochs",        5))
         self.batch_size    = int  (tcfg.get("batch_size",   12))
         self.warmup_frac   = float(tcfg.get("warmup_steps", 0.2))
@@ -116,7 +119,8 @@ class SingleTrainer:
             df_prep = pre.transform(df.copy())
 
         # ---------- 2  EWMA-TBL labelling ------------------------------------
-        lbl = MarketLabelerTBL(self.cfg_path)
+        lbl = MarketLabelerTBL(self.cfg_path,           # show bar if not quiet
+                               verbose=not self.quiet)
         if fit_preproc_on is None:              # fit on EA only
             df_lab = lbl.fit_and_label(df_prep)
             self._labeler = lbl
@@ -137,11 +141,13 @@ class SingleTrainer:
                      *, shuffle: bool) -> DataLoader:
         feats, lbls = [], []
         for _, row in df.iterrows():
+            rsi_bucket = row.get("RSI_bucket", "neutral")
+            roc_bucket = row.get("ROC_bucket", "neutral")
             tok = self.model.preprocess_input(
                 tweet_content = row["Tweet Content"],
-                rsi           = row["RSI"],
-                roc           = row["ROC"],
                 previous_label= row["Previous Label"],
+                rsi_bucket=rsi_bucket,
+                roc_bucket=roc_bucket,
             )
             tok.pop("token_type_ids", None)
             feats.append(tok)
@@ -174,39 +180,38 @@ class SingleTrainer:
         val_loader   = self._make_loader(train_proc, shuffle=False)  # same data, no shuffle
         
         tot_steps = len(train_loader) * self.epochs
-        sched = get_linear_schedule_with_warmup(
+        sched = get_cosine_schedule_with_warmup(
             self.optimizer,
-            int(tot_steps * self.warmup_frac),
-            tot_steps
+            num_warmup_steps=int(tot_steps * self.warmup_frac),
+            num_training_steps=tot_steps,
+            num_cycles=0.5              # one warm restart halfway
         )
         
-        # ---------- choose class weights α (optional) ----------
-        # Count class frequencies in training data
+        # ---------- weighted CE + 0.05 label-smoothing ---------------------------
+        # • compute inverse-frequency class weights on-the-fly
         labels = train_proc["Label"].values
-        n_bear = (labels == "Bearish").sum()
-        n_neut = (labels == "Neutral").sum()
-        n_bull = (labels == "Bullish").sum()
-        
-        freq = torch.tensor([n_bear, n_neut, n_bull], dtype=torch.float32)
-        alpha = (1.0 / freq) * (freq.sum() / 3)         # inversely proportional
-        alpha = alpha.to(self.device)
+        cls_freq = torch.tensor([
+            (labels == "Bearish").sum(),
+            (labels == "Neutral").sum(),
+            (labels == "Bullish").sum()
+        ], dtype=torch.float32, device=self.device)
+        # weight_k = (1 / f_k)  ⋅  (mean(f))
+        inv = 1.0 / cls_freq
+        class_weight = (inv / inv.mean()).sqrt().clamp(max=1.6)   # √-inv, capped
 
-        gamma = 2.0
-
-        def focal_loss(logits, targets, alpha, gamma):
-            ce = torch.nn.functional.cross_entropy(
-                    logits, targets, reduction='none')      # per-sample CE
-            p_t = torch.exp(-ce)                           # = softmax prob of true class
-            foc = (alpha[targets] * (1 - p_t) ** gamma * ce).mean()
-            return foc
-
-        # cost = torch.tensor([[0,1,2],
-        #                      [1,0,1],
-        #                      [2,1,0]], device=self.device, dtype=torch.float32)
+        # ---------- class-balanced focal-loss helper -------------------------
+        def focal_loss(logits, targets, weight, gamma=1.5):
+            logp = torch.nn.functional.log_softmax(logits, dim=-1)
+            p_t  = logp.exp()
+            ce   = torch.nn.functional.nll_loss(
+                       logp, targets, weight=weight, reduction='none')
+            focal = ((1 - p_t.gather(1, targets.unsqueeze(1)).squeeze())**gamma) * ce
+            return focal.mean()
 
         self.model.bert_model.train()
         for epoch in range(1, self.epochs + 1):
-            loop = tqdm(train_loader, desc=f"epoch {epoch}/{self.epochs}", leave=False)
+            loop = tqdm(train_loader, desc=f"epoch {epoch}/{self.epochs}", leave=False,
+                        disable=self.quiet, ncols=80, mininterval=0.5)
             running = 0
             # --------------- training loop (unchanged) ----------------------
             for step, batch in enumerate(loop, 1):
@@ -216,7 +221,7 @@ class SingleTrainer:
                                             if k in ("input_ids","attention_mask")})
 
                 # ----- training loop -----
-                loss = focal_loss(logits, lbls, alpha, gamma)
+                loss = focal_loss(logits, lbls, class_weight, gamma=1.5)
 
                 loss.backward()
                 self.optimizer.step();  sched.step();  self.optimizer.zero_grad()
@@ -263,7 +268,8 @@ class SingleTrainer:
         y_true: list[int] = []; y_pred: list[int] = []
 
         with torch.no_grad():
-            for batch in tqdm(loader, desc=f"eval {name}", leave=False):
+            for batch in tqdm(loader, desc=f"eval {name}", leave=False,
+                            disable=self.quiet, ncols=80, mininterval=0.5):
                 batch = {k:v.to(self.device) for k,v in batch.items()}
                 lbls  = batch.pop("labels")
                 logits= self.model.forward({k:v for k,v in batch.items()
@@ -357,6 +363,94 @@ def plot_training_history(trainer: SingleTrainer, outdir: Path | None = None):
             print(f"Final val F1: {df['val_f1'].iloc[-1]:.3f}")
 
 # --------------------------------------------------------------------- #
+#                    Ensemble inference helpers                          #
+# --------------------------------------------------------------------- #
+def load_ensemble(ckpt_root: Path, cfg_path: str = "config.yaml") -> list[Model]:
+    """
+    Load all models from seed directories for ensemble inference.
+    
+    Args:
+        ckpt_root: Root directory containing seed* subdirectories
+        cfg_path: Path to config file for model initialization
+        
+    Returns:
+        List of loaded models ready for inference
+    """
+    import yaml
+    cfg = yaml.safe_load(open(cfg_path))
+    models = []
+    
+    for sub in ckpt_root.glob("seed*"):
+        m = Model(cfg["model"])
+        m.bert_model.from_pretrained(sub)
+        m.tokenizer.from_pretrained(sub)
+        m.bert_model.eval()
+        models.append(m)
+        print(f"✓ loaded model from {sub}")
+    
+    return models
+
+def predict_ensemble(models: list[Model], dataset: pd.DataFrame, 
+                    trainer: SingleTrainer, name: str = "ensemble") -> dict[str, Any]:
+    """
+    Run ensemble inference by averaging logits from all models.
+    
+    Args:
+        models: List of trained models
+        dataset: DataFrame to predict on
+        trainer: SingleTrainer instance (for preprocessing and loader)
+        name: Name for the evaluation results
+        
+    Returns:
+        Dictionary with evaluation metrics
+    """
+    # Use trainer's preprocessing pipeline
+    df_proc = trainer._prepare(dataset, fit_preproc_on=trainer._pre)
+    loader = trainer._make_loader(df_proc, shuffle=False)
+    
+    # Set all models to eval mode and move to device
+    for model in models:
+        model.bert_model.eval()
+        model.device = trainer.device
+        model.bert_model.to(trainer.device)
+    
+    y_true: list[int] = []
+    all_preds = []
+    
+    with torch.no_grad():
+        for batch in tqdm(loader, desc=f"ensemble {name}", leave=False,
+                         disable=trainer.quiet, ncols=80, mininterval=0.5):
+            batch = {k: v.to(trainer.device) for k, v in batch.items()}
+            lbls = batch.pop("labels")
+            
+            # Get logits from all models
+            logits = torch.stack([
+                mdl.forward({k: v for k, v in batch.items() 
+                           if k in ("input_ids", "attention_mask")})
+                for mdl in models
+            ], dim=0)  # [n_models, B, 3]
+            
+            # Average logits across models
+            mean_logits = logits.mean(dim=0)  # [B, 3]
+            probs = torch.softmax(mean_logits, dim=-1)
+            pred = probs.argmax(dim=-1).cpu().tolist()
+            
+            y_true.extend(lbls.cpu().tolist())
+            all_preds.extend(pred)
+    
+    # Compute metrics
+    cm = confusion_matrix(y_true, all_preds, labels=[0, 1, 2])
+    acc = accuracy_score(y_true, all_preds)
+    prec, rec, f1, _ = precision_recall_fscore_support(
+        y_true, all_preds, average="macro", zero_division=0)
+    
+    print(f"\n{name} confusion-matrix (rows=truth 0/1/2, cols=pred):\n{cm}")
+    print(f"{name} – acc {acc:.3f}  prec {prec:.3f}  rec {rec:.3f}  f1 {f1:.3f}")
+    
+    return {"name": name, "acc": acc, "prec": prec, "rec": rec, "f1": f1,
+            "cm": cm.tolist()}
+
+# --------------------------------------------------------------------- #
 #                           Usage Example                                #
 # --------------------------------------------------------------------- #
 """
@@ -370,7 +464,32 @@ eb_raw = pd.read_csv("data/#2val.csv")
 ea_df = _coerce_dates(ea_raw)
 eb_df = _coerce_dates(eb_raw)
 
-# Train and evaluate
+# Ensemble training with multiple seeds
+SEEDS = [42, 1337, 2025]  # three independent seeds
+OUT_DIR = Path("models/ensemble")
+
+for seed in SEEDS:
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    model = Model(config["model"])
+    trainer = SingleTrainer(model, "config.yaml", quiet=True)
+    trainer.lr = 2e-5
+    trainer.epochs = 3
+    trainer.warmup_frac = 0.20
+    trainer.fit(ea_df)
+    
+    ckpt_dir = OUT_DIR / f"seed{seed}"
+    save_model(model, ckpt_dir)
+
+# Ensemble inference
+models = load_ensemble(OUT_DIR, "config.yaml")
+trainer = SingleTrainer(Model(config["model"]), "config.yaml")  # for preprocessing
+
+# Evaluate ensemble on both datasets
+ea_ensemble_results = predict_ensemble(models, ea_df, trainer, name="EA (ensemble)")
+eb_ensemble_results = predict_ensemble(models, eb_df, trainer, name="EB (ensemble)")
+
+# Single model training (original approach)
 model = Model(config["model"])
 trainer = SingleTrainer(model, "config.yaml")
 

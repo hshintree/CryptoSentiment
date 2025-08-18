@@ -27,6 +27,7 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from sklearn.model_selection import TimeSeriesSplit
 from collections import defaultdict          # ← we already imported numpy once
 from sklearn.metrics import confusion_matrix          # ➟ confusion-matrix
+from sklearn.metrics import f1_score          # ← NEW
 
 from model                 import Model
 from market_labeler_ewma   import MarketLabelerTBL, MarketFeatureGenerator
@@ -38,7 +39,8 @@ class Trainer:
     def __init__(self,
                  model: Model,
                  data: pd.DataFrame,
-                 config_path: str = "config.yaml") -> None:
+                 config_path: str = "config.yaml",
+                 quiet: bool = False) -> None:
 
         with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
@@ -46,6 +48,7 @@ class Trainer:
         self.config_path = config_path  # Store for fold-wise preprocessing
         self.model = model
         self.data  = data
+        self.quiet = quiet
         
         # ─── DEVICE SETUP ───────────────────────────────────────────
         # Prefer CUDA, then MPS, then CPU
@@ -86,10 +89,11 @@ class Trainer:
 
         tcfg = self.config["training"]
         # ---- cast YAML scalars safely -----------------------------------
-        self.learning_rate = float(tcfg.get("learning_rate", 1e-5))
+        # ↩️  Revert to the hyper-params that gave ~90 % acc
+        self.learning_rate = float(tcfg.get("learning_rate", 2e-5))
         self.batch_size    = int  (tcfg.get("batch_size",    12))
-        self.epochs        = int  (tcfg.get("epochs",        2))
-        self.warmup_frac   = float(tcfg.get("warmup_steps",  0.1))
+        self.epochs        = int  (tcfg.get("epochs",        3))
+        self.warmup_frac   = float(tcfg.get("warmup_steps",  0.2))   # 20 % LR warm-up
         # -----------------------------------------------------------------
 
         # Set reproducibility seeds
@@ -238,17 +242,17 @@ class Trainer:
             # ── Correlations (raw & per-fold) ──────────────────────────────
             _code = {"Bearish": 0, "Neutral": 1, "Bullish": 2}
 
-            # (A)  **fold-local**  — raw RSI/ROC (inverse-scaled)
-            raw_val = va_df.copy()
-            raw_val[["RSI", "ROC"]] = (
-                fold_preprocessor.scaler.inverse_transform(
-                    raw_val[["RSI", "ROC"]]
-                )
-            )
-            encoded = raw_val.replace(_code)
+            # (A)  **fold-local**  — bucketised RSI/ROC
+            encoded = va_df.replace(_code)      # keep label ints, buckets stay strings
 
+            # ── turn bucket strings into numeric codes for correlation ──────────
+            bucket_map = {"bearish": 0, "neutral": 1, "bullish": 2}
+            encoded["RSI_b"] = encoded["RSI_bucket"].map(bucket_map)
+            encoded["ROC_b"] = encoded["ROC_bucket"].map(bucket_map)
+
+            # tweet-level Pearson ρ
             feature_cols = [
-                "Previous Label", "RSI", "ROC", "Volume",
+                "Previous Label", "RSI_b", "ROC_b", "Volume",
                 "has_user_metadata", "has_tweet_metadata", "user_followers",
             ]
             feature_corrs = {}
@@ -263,7 +267,7 @@ class Trainer:
                 if not np.isnan(c):
                     feature_corrs[col] = c
 
-            print("ρ(feature , Label) on *this fold*:")
+            print("ρ(feature , Label) on *this fold*  (per-tweet, bucketised RSI/ROC):")
             for k, v in sorted(feature_corrs.items(), key=lambda kv: -abs(kv[1])):
                 print(f"   {k:<18}: {v:+.3f}")
 
@@ -289,55 +293,16 @@ class Trainer:
                      .first()                     # one row per day
                      .replace(_code)
             )
-            for ind in ("RSI", "ROC"):
+            daily_val["RSI_b"] = daily_val["RSI_bucket"].map(bucket_map)
+            daily_val["ROC_b"] = daily_val["ROC_bucket"].map(bucket_map)
+
+            for ind in ("RSI_b", "ROC_b"):
                 if ind in daily_val.columns:
                     c = daily_val[[ind, "Label"]].corr().iloc[0, 1]
-                    print(f"      ↳ {ind:3}  day-level corr : {c:+.3f}")
+                    print(f"      ↳ {ind.replace('_b',''):3}  day-level corr : {c:+.3f}")
 
-            # (B)  **optional EA-wide diagnostic** – now the safe way
-            if fold == 1 and not hasattr(self, "_global_corr_done"):
-                # --- 1. same preprocessing -------------------------------
-                full_raw = fold_preprocessor.transform(data.copy())
-                full_raw[["RSI", "ROC"]] = fold_preprocessor.scaler.inverse_transform(
-                    full_raw[["RSI", "ROC"]]
-                )
-
-                # --- 2. label entire EA once (no peeking) ---------------
-                ea_labeler = MarketLabelerTBL("config.yaml")
-                full_raw   = ea_labeler.fit_and_label(full_raw)
-
-                # --- 3. causal previous-label ---------------------------
-                feat_gen_global = MarketFeatureGenerator()
-                full_raw["Previous Label"] = feat_gen_global.transform(full_raw)
-
-                # --- 4. day-level aggregates & correlations -------------
-                daily_mean = (
-                    full_raw
-                    .groupby(full_raw["Tweet Date"].dt.normalize())
-                    .agg({
-                        "Previous Label": "first",   # regime is discrete
-                        "RSI":            "mean",
-                        "ROC":            "mean",
-                        "Volume":         "mean",
-                        "Label":          "first",
-                    })
-                    .replace(_code)
-                )
-                gcorr = (
-                    daily_mean[["Previous Label", "RSI", "ROC", "Volume", "Label"]]
-                    .corr()
-                    .iloc[:-1, -1]    # everything versus ground-truth Label
-                )
-
-                print("\n🌐 ρ(feature , Label) on *entire EA* (day-level, mean-aggregated):")
-                for k, v in gcorr.abs().sort_values(ascending=False).items():
-                    print(f"   {k:<18}: {v:+.3f}")
-
-                # extra print focused on RSI/ROC only
-                print(f"      ↳ RSI  day-level corr : {gcorr['RSI']:+.3f}")
-                print(f"      ↳ ROC  day-level corr : {gcorr['ROC']:+.3f}")
-
-                self._global_corr_done = True
+            # (global EA correlations have been moved out to full_cv_run.py
+            #   → keeps the training loop lightweight and leak-free)
             
             # 🔍 DEBUG: Analyze data leakage potential
             print(f"\n  🔍 FOLD {fold} DEBUG ANALYSIS:")
@@ -406,16 +371,20 @@ class Trainer:
             # Track metrics for this fold
             fold_history = {"fold": fold, "epochs": []}
 
+            best_f1 = -1.0                                  # ← track best F1
             for epoch in range(self.epochs):
                 loop = tqdm(tr_loader, desc=f"fold {fold} epoch {epoch+1}/{self.epochs}",
-                leave=False)
+                leave=False, disable=self.quiet, ncols=80, mininterval=0.5)
                 print(f"  Epoch {epoch+1}/{self.epochs}")
                 train_loss = self._train_one_epoch_fold(loop, fold_model, fold_optimizer, fold_scheduler)
                 
                 # ── run validation with progress bar & capture preds ─────────
-                val_loss, val_acc, y_true, y_pred = self._evaluate_fold(
+                val_loss, val_acc, val_f1, y_true, y_pred = self._evaluate_fold(
                     va_loader, fold_model
                 )
+
+                if val_f1 > best_f1:                        # best-epoch F1
+                    best_f1 = val_f1
 
                 # -----------------------------------------------------------------
                 # 🧊  ONE-CHECKPOINT POLICY
@@ -531,8 +500,11 @@ class Trainer:
             fold_model.bert_model.to("cpu")
             print(f"  💾 Moved Fold {fold} model to CPU to free MPS memory")
             
-            # Store this fold's model (now on CPU)
-            self.fold_states.append({"model": fold_model})
+            # Store fold model **and** its best validation F1
+            self.fold_states.append({
+                "model":   fold_model,
+                "val_f1":  best_f1
+            })
             
         print(f"\n✅ Training complete! {len(self.fold_states)} independent fold models created.")
 
@@ -591,11 +563,13 @@ class Trainer:
     def _make_loader(self, df: pd.DataFrame, *, shuffle: bool) -> DataLoader:
         feats, lbls = [], []
         for _, row in df.iterrows():
+            roc_bucket = row.get("ROC_bucket", "neutral")
+            rsi_bucket = row.get("RSI_bucket", "neutral")
             tok = self.model.preprocess_input(
                 tweet_content=row["Tweet Content"],
-                rsi=row["RSI"],
-                roc=row["ROC"],
                 previous_label=row["Previous Label"],
+                rsi_bucket=rsi_bucket,
+                roc_bucket=roc_bucket,
             )
             # Remove token_type_ids and keep other tensors as is
             if "token_type_ids" in tok:
@@ -666,6 +640,8 @@ class Trainer:
                 print("  input_ids  max id:", batch["input_ids"].max().item())
                 print("  input_ids  shape:", batch["input_ids"].shape)
                 # If you have an attention_mask, print its dtype & shape:
+                print("Prompt example:",
+                    self.model.tokenizer.decode(batch["input_ids"][0, :100]))
                 if "attention_mask" in batch:
                     print("  attn_mask shape:", batch["attention_mask"].shape)
                 
@@ -685,15 +661,22 @@ class Trainer:
             # Use model's forward method (handles prompt-tuning automatically)
             logits = model.forward(model_args)
             
+            # ✅ Plain CE (+ 5 % label-smoothing) – no cost matrix
+            loss = torch.nn.functional.cross_entropy(
+                logits,
+                lbls,
+                label_smoothing=0.05
+            )
+            
             # cost matrix so flips → 2 × penalty (was 3), Neutral errors → 1 ×
-            cost = torch.tensor([[0,1,2],
-                                [1,0,1],
-                                [2,1,0]], device=logits.device, dtype=logits.dtype)
-            # compute expected cost
-            probs = torch.softmax(logits, dim=-1)
-            ce     = torch.nn.functional.cross_entropy(logits, lbls, reduction='none')
-            flip_c = cost[lbls, probs.argmax(dim=-1)]
-            loss   = (ce * (1 + flip_c)).mean()
+            # cost = torch.tensor([[0,1,2],
+            #                     [1,0,1],
+            #                     [2,1,0]], device=logits.device, dtype=logits.dtype)
+            # # compute expected cost
+            # probs = torch.softmax(logits, dim=-1)
+            # ce     = torch.nn.functional.cross_entropy(logits, lbls, reduction='none')
+            # flip_c = cost[lbls, probs.argmax(dim=-1)]
+            # loss   = (ce * (1 + flip_c)).mean()
             
             # Track loss
             total_loss += loss.item()
@@ -710,7 +693,7 @@ class Trainer:
 
     def _evaluate_fold(
         self, loader: DataLoader, model: Model
-    ) -> Tuple[float, float, list[int], list[int]]:
+    ) -> Tuple[float, float, float, list[int], list[int]]:
         model.bert_model.eval()
         correct = total = 0
         total_loss = 0.0
@@ -718,7 +701,8 @@ class Trainer:
         
         y_true, y_pred = [], []
         with torch.no_grad():
-            for batch in tqdm(loader, desc="eval", leave=False):
+            for batch in tqdm(loader, desc="eval", leave=False,
+                            disable=self.quiet, ncols=80, mininterval=0.5):
                 # move to device
                 batch = {k: v.to(self.device) for k, v in batch.items()}
                 lbls = batch.pop("labels")
@@ -729,14 +713,15 @@ class Trainer:
                 
                 logits = model.forward(model_args)
                 probs  = torch.softmax(logits, dim=-1)      # [B,3]
-
                 # ── confidence gating ─────────────────────
-                pred_idx = probs.argmax(dim=-1)             # [B]
+                # pred_idx = probs.argmax(dim=-1)             # [B]
                 # grab the probability of the chosen class for every item
-                conf = probs.gather(1, pred_idx.unsqueeze(1)).squeeze(1)  # [B]
-                low_conf = conf < 0.35
-                pred_idx[low_conf] = 1                      # force to Neutral
-                preds = pred_idx
+                # conf = probs.gather(1, pred_idx.unsqueeze(1)).squeeze(1)  # [B]
+                # low_conf = conf < 0.35
+                # pred_idx[low_conf] = 1                      # force to Neutral
+                # preds = pred_idx
+                # Simple argmax prediction (no confidence gating)
+                preds = probs.argmax(dim=-1)                # [B]
                 
                 # Calculate loss and accuracy
                 loss = torch.nn.functional.cross_entropy(logits, lbls)
@@ -749,10 +734,89 @@ class Trainer:
                 total += lbls.size(0)
         
         avg_loss = total_loss / max(num_batches, 1)
-        acc = correct / max(total, 1)
-        
+        acc      = correct / max(total, 1)
+        f1       = f1_score(y_true, y_pred, average="macro", zero_division=0)
         model.bert_model.train()
-        return avg_loss, acc, y_true, y_pred
+        return avg_loss, acc, f1, y_true, y_pred
+
+    # ────────────────────────────────────────────────────────────────
+    # NEW: Soft-probability ensemble across all fold models
+    # ────────────────────────────────────────────────────────────────
+    def ensemble_predict(
+        self,
+        data: pd.DataFrame,
+        *,
+        cfg_path: str = "config.yaml",
+        weighted: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Return per-row predictions where the class probabilities are
+        averaged over *all* fold models.  
+        If ``weighted=True`` each fold is weighted by its best val-F1.
+        """
+        from preprocessor           import Preprocessor
+        from market_labeler_ewma    import MarketLabelerTBL, MarketFeatureGenerator
+
+        device      = self.device
+        n_models    = len(self.fold_states)
+        weights     = np.ones(n_models, dtype=np.float32)
+        if weighted:
+            weights = np.array([fs.get("val_f1", 1.0) for fs in self.fold_states],
+                               dtype=np.float32)
+            weights = weights / weights.sum()
+
+        # 1) leak-safe preprocessing (scaler fitted on EA only) -----------
+        global_pre = Preprocessor(cfg_path)
+        global_pre.fit(self.data)                     # fit on EA
+        eval_df = global_pre.transform(data.copy())
+
+        # 2) labels must exist BEFORE Previous-Label is built -------------
+        lbl = MarketLabelerTBL(cfg_path, verbose=False)
+        lbl.fit_and_label(self.data)                  # fit on EA only
+        eval_df = lbl.apply_labels(eval_df)
+
+        # 3) causal Previous-Label (uses the *already present* Label col) -
+        feat_gen = MarketFeatureGenerator().fit(self.data)
+        eval_df["Previous Label"] = feat_gen.transform(eval_df)
+
+        # probability accumulator
+        probs_acc = np.zeros((len(eval_df), 3), dtype=np.float32)
+
+        loader    = self._make_loader(eval_df, shuffle=False)
+        row_ptr   = 0                          # keeps global row index
+
+        for w, fs in zip(weights, self.fold_states):
+            model = fs["model"]
+            model.bert_model.to(device)
+            model.bert_model.eval()
+
+            row_ptr = 0
+            with torch.no_grad():
+                for batch in loader:
+                    bsz     = batch["input_ids"].size(0)
+                    sl      = slice(row_ptr, row_ptr + bsz)
+                    row_ptr = row_ptr + bsz
+
+                    batch = {k: v.to(device) for k, v in batch.items()}
+                    batch.pop("labels", None)
+                    logits = model.forward(
+                        {k: v for k, v in batch.items()
+                         if k in ("input_ids", "attention_mask")}
+                    )
+                    probs  = torch.softmax(logits, dim=-1).cpu().numpy()
+                    probs_acc[sl] += w * probs
+
+            model.bert_model.to("cpu")
+
+        preds = probs_acc.argmax(axis=1)
+        conf  = probs_acc.max(axis=1)
+
+        out = data.copy()
+        out["Pred_Label"] = pd.Series(preds).map(
+            {0: "Bearish", 1: "Neutral", 2: "Bullish"}
+        )
+        out["Pred_Conf"]  = conf
+        return out
 
 def cross_val_predict(
     trainer: "Trainer",
@@ -851,15 +915,15 @@ def cross_val_predict(
                 # so we can pick by position instead of worrying about the space/underscore
                 # ------------------------------------------------------------------
                 tweet_txt      = row[va_df.columns.get_loc("Tweet Content")]
-                rsi_val        = row[va_df.columns.get_loc("RSI")]
-                roc_val        = row[va_df.columns.get_loc("ROC")]
                 prev_lbl       = row[va_df.columns.get_loc("Previous Label")]
+                rsi_bucket_val = row[va_df.columns.get_loc("RSI_bucket")] if "RSI_bucket" in va_df.columns else "neutral"
+                roc_bucket_val = row[va_df.columns.get_loc("ROC_bucket")] if "ROC_bucket" in va_df.columns else "neutral"
 
                 tok = model.preprocess_input(
                     tweet_content=tweet_txt,
-                    rsi=rsi_val,
-                    roc=roc_val,
                     previous_label=prev_lbl,
+                    rsi_bucket=rsi_bucket_val,
+                    roc_bucket=roc_bucket_val,
                 )
                 tok.pop("token_type_ids", None)
                 tok = {k: v.to(device) for k, v in tok.items()}
@@ -868,14 +932,8 @@ def cross_val_predict(
                                         if k in ("input_ids", "attention_mask")})
                 probs = torch.softmax(logits, dim=-1)[0]
                 
-                # Confidence gating
-                pred_idx = probs.argmax().item()
-                conf = probs[pred_idx].item()
-                # Apply confidence threshold - if confidence < 0.35, predict Neutral
-                if conf < 0.35:
-                    pred_idx = 1          # Neutral
-                
-                pred = pred_idx
+                # Simple argmax prediction (no confidence gating)
+                pred = probs.argmax().item()
 
                 votes[ridx].append(pred)
                 confs[ridx].append(probs[pred].item())

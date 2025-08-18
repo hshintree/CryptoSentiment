@@ -2,6 +2,7 @@
 • Uses continuous prompt embeddings prepended to input
 • Freezes all BERT parameters except prompt embeddings and classifier head
 • Pure text prompts for all features (no numeric_features)
+• Uses weighted ce with class weights, increasing dropout to .3
 """
 
 import os
@@ -24,23 +25,27 @@ class Model:
         self.use_prompt_tuning = params.get("prompt_tuning", True)
 
         if self.model_type == "CryptoBERT":
-            ckpt = "vinai/bertweet-base"
+            ckpt = "ElKulako/cryptobert"
+            print(f"🔹 Loading checkpoint ➜ {ckpt}")
         elif self.model_type == "FinBERT":
             ckpt = "yiyanghkust/finbert-tone"
+            print(f"🔹 Loading checkpoint ➜ {ckpt}")
         else:
             raise ValueError("Unsupported model type – choose CryptoBERT or FinBERT")
 
-        # enable MPS fallback and pick the right device
+        # prefer CUDA → then Apple-MPS → finally CPU
         os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-        self.device = torch.device(
-            "mps" if torch.backends.mps.is_available()
-            else "cuda" if torch.cuda.is_available()
-            else "cpu"
-        )
+        if torch.cuda.is_available():
+            _device = "cuda"
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            _device = "mps"
+        else:
+            _device = "cpu"
+        self.device = torch.device(_device)
         # load tokenizer + model, then move model to device
         self.tokenizer  = AutoTokenizer.from_pretrained(ckpt)
         self.bert_model = AutoModelForSequenceClassification.from_pretrained(
-            ckpt, num_labels=3
+            ckpt, num_labels=3, hidden_dropout_prob=0.3
         ).to(self.device)
         
         # Eagerly allocate embedding storage on MPS device
@@ -58,39 +63,43 @@ class Model:
             for param in self.bert_model.parameters():
                 param.requires_grad = False
 
-            # ...except the *last* transformer block (per paper)
-            for param in self.bert_model.base_model.encoder.layer[-1].parameters():
-                param.requires_grad = True
+            # unfreeze the last 2 layers
+            for layer in self.bert_model.base_model.encoder.layer[-2:]:
+                for param in layer.parameters():
+                    param.requires_grad = True
                 
             # Unfreeze the classifier head
             for param in self.bert_model.classifier.parameters():
                 param.requires_grad = True
                 
             print(f"Initialized prompt-tuning with {self.prompt_length} prompt tokens")
-            print("Frozen first 11 BERT layers - training prompt embeddings + last layer + classifier")
+            print("Frozen first 10 BERT layers - training prompt embeddings + last 2 layers + classifier")
 
     def preprocess_input(
         self,
         *,
         tweet_content: str,
-        rsi: float,
-        roc: float,
         previous_label: str,
+        rsi_bucket: str,
+        roc_bucket: str,
         log_volume: float | None = None,
     ) -> dict:
         """
         Tokenise pure text prompt including all numeric features as text.
         No separate numeric_features tensor - everything goes through text.
+        Uses dynamic ROC bucketing exclusively - no fixed constants.
         """
         # Include volume info in prompt if available
         volume_info = ""
         if log_volume is not None:
             volume_info = f" | Vol(log):{log_volume:.2f}"
             
-        # Pure text prompt with all features as readable text
+        # paper-exact wording, comma-space separators, **no trailing comma**
         prompt = (
-            f"Prev:{previous_label} | "
-            f"ROC:{roc:.4f} | RSI:{rsi:.2f}{volume_info} | Tweet:{tweet_content}"
+            f"Previous Label: {previous_label}, "
+            f"ROC: {roc_bucket}, "
+            f"RSI: {rsi_bucket}{volume_info}, "
+            f"Tweet: {tweet_content}"
         )
         
         # Tokenize prompt and let HF handle positions & truncation at 128

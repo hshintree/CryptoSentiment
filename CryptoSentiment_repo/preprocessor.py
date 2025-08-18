@@ -1,4 +1,5 @@
 import re
+from tqdm.auto import tqdm          # NEW
 import pandas as pd
 import numpy as np
 import yaml
@@ -42,6 +43,8 @@ class Preprocessor:
         data = data.copy()
         
         ## 1) Text cleanup & normalization
+        tqdm.pandas(desc="Cleaning text")   # enable .progress_apply()
+
         def clean_text(text: str) -> str:
             # 1a) unify case
             txt = text.lower()
@@ -67,16 +70,23 @@ class Preprocessor:
                 emojis = ' '.join(tokens)
             return emojis
 
-        data['Tweet Content'] = data['Tweet Content'].astype(str).apply(clean_text)
+        # ▲ progress_apply gives you a live bar for this expensive loop
+        data['Tweet Content'] = (
+            data['Tweet Content']
+                .astype(str)
+                .progress_apply(clean_text)
+        )
 
         ## 2) Technical indicators
         if 'Close' in data.columns:
             delta = data['Close'].diff(1)
-            gain = delta.clip(lower=0).rolling(window=14).mean()
-            loss = (-delta).clip(lower=0).rolling(window=14).mean()
-            rs = gain / loss
-            data['RSI'] = 100 - (100 / (1 + rs))
-            data['ROC'] = (
+            gain  = delta.clip(lower=0).rolling(window=14).mean()
+            loss  = (-delta).clip(lower=0).rolling(window=14).mean()
+            rs    = gain / loss
+
+            # keep the **raw** 0‒100 RSI / %ROC that the paper discretises
+            data['RSI_raw'] = 100 - (100 / (1 + rs))
+            data['ROC_raw'] = (
                 data['Close']
                     .pct_change(periods=self.roc_window_length)
                     .mul(100)
@@ -89,13 +99,62 @@ class Preprocessor:
         # Only forward-fill (propagate past into future), no backward-fill
         data = data.ffill()
         # Fill any initial NaNs in RSI/ROC with neutral defaults (no leakage)
-        if 'RSI' in data.columns:
+        if 'RSI_raw' in data.columns:
             neutral_rsi = sum(self.rsi_threshold) / 2  # midpoint between thresholds, e.g. 50
-            data['RSI'] = data['RSI'].fillna(neutral_rsi)
-        if 'ROC' in data.columns:
-            data['ROC'] = data['ROC'].fillna(0.0)
+            data['RSI_raw'] = data['RSI_raw'].fillna(neutral_rsi)
+        if 'ROC_raw' in data.columns:
+            data['ROC_raw'] = data['ROC_raw'].fillna(0.0)
         # Zero out any other residual NaNs (e.g. log_volume) safely
         data = data.fillna(0)
+        
+        # ---------- RSI & ROC buckets (paper wording) --------------------
+        if {"RSI_raw", "ROC_raw"}.issubset(data.columns):
+
+            roc      = data["ROC_raw"]
+            σ        = roc.rolling(8, min_periods=8).std()
+            upper, lower =  σ, -σ
+
+            # --- ⚫ NEW: RSI → oversold / overbought ------------------
+            def _bucket_rsi(v: float) -> str:
+                if v < 30:   return "oversold"     # bullish bias
+                if v > 70:   return "overbought"   # bearish bias
+                return "neutral"
+            data["RSI_bucket"] = data["RSI_raw"].apply(_bucket_rsi)
+
+            # --- ⚫ NEW: ROC → five buckets ---------------------------
+            def _bucket_roc(v, lo, hi, sigma_val) -> str:
+                if pd.isna(lo) or pd.isna(hi) or pd.isna(sigma_val):
+                    return "neutral"
+                if v <= lo - sigma_val:   return "falling fast"
+                if v <  0:                return "falling"
+                if v >= hi + sigma_val:   return "rising fast"
+                if v >  0:                return "rising"
+                return "neutral"
+
+            data["ROC_bucket"] = [
+                _bucket_roc(v, lo, hi, sigma_val) for v, lo, hi, sigma_val in zip(roc, lower, upper, σ)
+            ]
+
+            # #   ALTERNATIVE: RSI with oversold/overbought labels
+            # def _bucket_rsi_alt(v: float) -> str:
+            #     if v < 30:   return "oversold"
+            #     if v > 70:   return "overbought"
+            #     return "neutral"
+            # data["RSI_bucket"] = data["RSI_raw"].apply(_bucket_rsi_alt)
+
+            # #   ALTERNATIVE: ROC with five buckets, thresholds = ±1 σ over last 8 days
+            # def _bucket_roc_alt(v, lo, hi) -> str:
+            #     if pd.isna(lo) or pd.isna(hi):
+            #         return "neutral"
+            #     if v <= lo:      return "falling fast"
+            #     if v <  0:       return "falling"
+            #     if v >= hi:      return "rising fast"
+            #     if v >  0:       return "rising"
+            #     return "neutral"
+            # data["ROC_bucket"] = [
+            #     _bucket_roc_alt(v, lo, hi) for v, lo, hi in zip(roc, lower, upper)
+            # ]
+        
         return data
 
     # ⚠️ removed def preprocess to avoid accidental global scaling
@@ -103,9 +162,12 @@ class Preprocessor:
     def fit(self, df: pd.DataFrame) -> pd.DataFrame:
         """Fit the RSI/ROC scaler on df, return scaled df."""
         data = self._compute_indicators(df)
-        if {'RSI','ROC'}.issubset(data.columns):
-            self.scaler = MinMaxScaler().fit(data[['RSI','ROC']])
-            data[['RSI','ROC']] = self.scaler.transform(data[['RSI','ROC']])
+        # scale *copies* so you can still access the raw values later
+        if {'RSI_raw', 'ROC_raw'}.issubset(data.columns):
+            self.scaler = MinMaxScaler().fit(data[['RSI_raw', 'ROC_raw']])
+            data[['RSI', 'ROC']] = self.scaler.transform(
+                data[['RSI_raw', 'ROC_raw']]
+            )
         return data
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -113,9 +175,20 @@ class Preprocessor:
         if self.scaler is None:
             raise RuntimeError("Must call fit() before transform()")
         data = self._compute_indicators(df)
-        data[['RSI','ROC']] = self.scaler.transform(data[['RSI','ROC']])
+        data[['RSI', 'ROC']] = self.scaler.transform(data[['RSI_raw', 'ROC_raw']])
         return data
 
     def fit_transform(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Convenience: fit() then transform()."""
-        return self.fit(df)
+        """
+        Convenience: fit() then transform().
+        Adds   • RSI_raw / ROC_raw        – numeric (inverse–scaled)
+               • RSI_bucket / ROC_bucket  – categorical buckets
+        """
+        out = self.fit(df)
+
+        # ---------- keep *numeric* copies for correlation & plots ----------
+        out[["RSI_raw", "ROC_raw"]] = (
+            self.scaler.inverse_transform(out[["RSI", "ROC"]])
+        )
+
+        return out      # buckets are already in *out* thanks to _compute_indicators

@@ -25,6 +25,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 import yaml
+from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
 # Configuration dataclass ----------------------------------------------------
@@ -143,11 +144,12 @@ def _risk_adjusted_sharpe(returns: pd.Series, risk_free_rate: float = 0.04) -> f
 # ---------------------------------------------------------------------------
 
 class MarketLabelerTBL:
-    def __init__(self, cfg_path: str = "config.yaml") -> None:
+    def __init__(self, cfg_path: str = "config.yaml", verbose: bool = True) -> None:
         self.cfg = _TBLConfig.from_yaml(cfg_path)
         # Store fitted thresholds to prevent leakage
         self._fitted_thresholds = None
         self._fitted_volatility_params = None
+        self.verbose = verbose
 
     # ------------------------------------------------------------------
     def label_data(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -182,7 +184,13 @@ class MarketLabelerTBL:
         # Rolling optimization on daily price data
         daily_step = self.cfg.rebalance_days
         
-        for daily_start in range(0, len(daily_prices), daily_step):
+        iterator = tqdm(range(0, len(daily_prices), daily_step),
+                        desc="EWMA-TBL",
+                        disable=not self.verbose,
+                        ncols=70,
+                        mininterval=0.5)
+        
+        for daily_start in iterator:
             daily_end = min(daily_start + daily_step, len(daily_prices))
             
             # Grid-search on the *previous* daily window
