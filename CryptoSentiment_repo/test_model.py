@@ -9,39 +9,40 @@ from model import Model
 def test_model():
     print("Testing Model with prompt-tuning...")
     
-    # Initialize model
+    # Initialize model - it will auto-detect and use the best device
     model = Model("config.yaml")
+    
+    print(f"Model using device: {model.device}")
+    print(f"BERT model device: {next(model.bert_model.parameters()).device}")
+    print(f"Input embeddings device: {next(model.bert_model.get_input_embeddings().parameters()).device}")
+    if hasattr(model, 'prompt_embeddings'):
+        print(f"Prompt embeddings device: {model.prompt_embeddings.device}")
     
     # Create sample input
     sample_input = model.preprocess_input(
         tweet_content="Bitcoin is going to the moon!",
-        rsi=65.0,
-        roc=0.025,
-        previous_label="Bullish"
+        previous_label="Bullish",
+        rsi_bucket="neutral",
+        roc_bucket="rising"
     )
     
-    print("Sample input keys:", sample_input.keys())
+    print("\nSample input keys:", sample_input.keys())
     print("Input IDs shape:", sample_input["input_ids"].shape)
     print("Attention mask shape:", sample_input["attention_mask"].shape)
     
-    # Move to device (test on CPU first)
-    device = torch.device("cpu")
-    model.bert_model.to(device)
-    if hasattr(model, 'prompt_embeddings'):
-        model.prompt_embeddings.data = model.prompt_embeddings.data.to(device)
-    
-    batch = {k: v.to(device) for k, v in sample_input.items()}
-    
-    # Remove position_ids if present (not needed for forward)
-    if "position_ids" in batch:
-        del batch["position_ids"]
+    # Remove token_type_ids since we don't use them
+    if "token_type_ids" in sample_input:
+        del sample_input["token_type_ids"]
     
     # Test forward pass
     print("\nTesting forward pass...")
+    model.bert_model.eval()
     with torch.no_grad():
         try:
-            model_args = {k: v for k, v in batch.items() 
+            # Model.forward() handles device placement internally
+            model_args = {k: v for k, v in sample_input.items() 
                          if k in ["input_ids", "attention_mask"]}
+            
             logits = model.forward(model_args)
             print("✅ Forward pass successful!")
             print("Logits shape:", logits.shape)
@@ -50,6 +51,11 @@ def test_model():
             # Test softmax
             probs = torch.softmax(logits, dim=-1)
             print("Probabilities:", probs)
+            
+            # Test prediction
+            pred = logits.argmax(dim=-1).item()
+            pred_label = {0: "Bearish", 1: "Neutral", 2: "Bullish"}[pred]
+            print(f"Prediction: {pred_label} (class {pred})")
             
         except Exception as e:
             print("❌ Forward pass failed:")

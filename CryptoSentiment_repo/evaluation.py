@@ -64,12 +64,13 @@ class Evaluation:
         """
         predictions = []
         for i, row in self.data.iterrows():
+            rsi_bucket = row.get("RSI_bucket", "neutral")
+            roc_bucket = row.get("ROC_bucket", "neutral")
             inputs = self.model.preprocess_input(
                 tweet_content=row['Tweet Content'],
-                rsi=row['RSI'],
-                roc=row['ROC'],
-                date=row['Tweet Date'],
-                previous_label=row['Previous Label']
+                previous_label=row['Previous Label'],
+                rsi_bucket=rsi_bucket,
+                roc_bucket=roc_bucket,
             )
             logits = self.model.forward(inputs)
             predicted_label = logits.argmax(dim=-1).item()

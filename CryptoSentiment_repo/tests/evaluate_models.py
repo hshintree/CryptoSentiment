@@ -21,32 +21,21 @@ from glob     import glob
 from tqdm     import tqdm
 import torch
 import yaml
-from transformers import (AutoTokenizer,
-                          AutoModelForSequenceClassification)
 from sklearn.metrics import (accuracy_score,
-                             precision_recall_fscore_support)
-from preprocessor import Preprocessor
-from market_labeler_ewma import MarketLabelerTBL, MarketFeatureGenerator
-from model import Model                       # only for preprocess_input
+                             precision_recall_fscore_support,
+                             confusion_matrix)
+
+# ── Crypto-Sentiment code -----------------
+from model   import Model
+from trainer import Trainer
 
 # ------------------------------------------------------------------ #
 # 1)  FIT PREPROCESSOR ON THE *TRAINING* SET ONLY                    #
 # ------------------------------------------------------------------ #
-EA_CSV     = Path("data/#1train.csv")
-ea_train   = pd.read_csv(EA_CSV)
-ea_train["date"] = pd.to_datetime(ea_train["date"], errors="coerce")
-
-pre        = Preprocessor("config.yaml")
-ea_train   = pre.fit(ea_train)      # fit scaler, no leak
-
-# prepare labeler+feature generator for Previous-Label
-tbl        = MarketLabelerTBL("config.yaml")
-ea_train   = tbl.fit_and_label(ea_train)
-feat_gen   = MarketFeatureGenerator("config.yaml")
-feat_gen.fit(ea_train)
-
-# dummy model instance – only used for .preprocess_input()
-dummy_model = Model(yaml.safe_load(open("config.yaml"))["model"])
+EA_CSV   = Path("data/#1train.csv")
+ea_train = (pd.read_csv(EA_CSV)
+              .rename(columns={"date": "Tweet Date"}))
+ea_train["Tweet Date"] = pd.to_datetime(ea_train["Tweet Date"], errors="coerce")
 
 # --------------------------------------------------------------------- #
 # -------------------------- CLI ARGUMENTS ---------------------------- #
@@ -97,21 +86,32 @@ DEVICE = (
 )
 print(f"🔹 Running inference on {DEVICE}")
 
+# ------------------------------------------------------------------#
+#  Trainer object that knows how to preprocess & ensemble
+# ------------------------------------------------------------------#
+cfg = yaml.safe_load(open("config.yaml"))
+base_model = Model(cfg["model"])
+trainer = Trainer(base_model,  # dummy model just for preprocessing
+                  ea_train,
+                  "config.yaml",
+                  quiet=True)
+trainer.device = DEVICE
+base_model.device = DEVICE
+base_model.bert_model.to(DEVICE)
+trainer.fold_states = []          # we'll fill it next
+
+print("\n🔹 Loading fold checkpoints …")
+
 # ------------------------------------------------------------------
 # Which folds should participate in the ensemble?
 #   • Give an explicit set → we will load only those
 #   • Leave the set empty  → load every folder that exists
 # ------------------------------------------------------------------
-#USE_FOLDS = {"fold2", "fold3"}        # ← EXAMPLE 1  (drop 1 & 4)
 #USE_FOLDS = {"fold2"}               # ← EXAMPLE 2  (strongest only)
 USE_FOLDS = set()                     # finds all available fold directories
 
-def _softmax(x):
-    e = np.exp(x - x.max(axis=-1, keepdims=True))
-    return e / e.sum(-1, keepdims=True)
-
-probs = np.zeros((len(VAL), 3), dtype=float)
-n_live_folds = 0
+# We do **not** hand-craft prompts or soft-max any more – the
+# Trainer object will do leakage-safe preprocessing + averaging.
 
 # ------------------------------------------------------------------
 # Resolve folders – accept either:
@@ -137,59 +137,36 @@ else:
                             | set(CKPT_ROOT.glob("fold[0-9]*")))
 
 for fold_dir in candidate_dirs:
-    bin_ok   = (fold_dir / "pytorch_model.bin").exists()
-    safe_ok  = (fold_dir / "model.safetensors").exists()
-    if not (bin_ok or safe_ok):
-        print(f"⚠️  {fold_dir.name} – no model file, skipping")
+    chk_bin  = fold_dir / "pytorch_model.bin"
+    chk_safe = fold_dir / "model.safetensors"
+    if not (chk_bin.exists() or chk_safe.exists()):
+        print(f"⚠️  {fold_dir.name}: no model file → skip")
         continue
 
-    print(f"🔗 Loading {fold_dir.name} …")
-    tok = AutoTokenizer.from_pretrained(fold_dir)
-    mdl = (AutoModelForSequenceClassification
-           .from_pretrained(fold_dir)
-           .to(DEVICE)
-           .eval())
-    n_live_folds += 1
-    bs = 256 if DEVICE.type in {"cuda", "mps"} else 128
+    m = Model(cfg["model"])
+    m.bert_model.from_pretrained(fold_dir)
+    m.tokenizer.from_pretrained(fold_dir)
+    m.device = DEVICE
+    m.bert_model.to("cpu")           # keep off-GPU until used
 
-    with torch.no_grad():
-        for i in tqdm(range(0, len(VAL), bs), desc=fold_dir.name, ncols=80):
-            chunk = VAL.iloc[i:i+bs]
-            # ----------------------------------------------------------------
-            # 2)  REBUILD THE EXACT PROMPT FOR **EACH TWEET** IN THE CHUNK
-            # ----------------------------------------------------------------
-            chunk_proc = pre.transform(chunk.copy())
-            chunk_proc = tbl.apply_labels(chunk_proc)          # adds Label
-            chunk_proc["Previous Label"] = feat_gen.transform(chunk_proc)
+    # try to fetch best-fold F1 for weighting; fall back to 1.0
+    mjson = fold_dir / "metrics.json"
+    val_f1 = 1.0
+    if mjson.exists():
+        try:
+            with open(mjson) as fh:
+                val_f1 = json.load(fh).get("val_f1", 1.0)
+        except Exception:
+            pass
 
-            prompts = [
-                dummy_model.preprocess_input(
-                    tweet_content = row["Tweet Content"],
-                    rsi           = row["RSI"],
-                    roc           = row["ROC"],
-                    previous_label= row["Previous Label"],
-                    as_prompt_only=True          # <- return plain string
-                )
-                for _, row in chunk_proc.iterrows()
-            ]
+    trainer.fold_states.append({"model": m, "val_f1": val_f1})
+    print(f"   ✓ added {fold_dir.name}  (val_F1={val_f1:.3f})")
 
-            enc = tok(prompts,
-                      padding=True, truncation=True, max_length=128,
-                      return_tensors="pt")
-            out   = mdl(**{k: v.to(DEVICE) for k, v in enc.items()})
-            probs[i:i+bs] += _softmax(out.logits.cpu().numpy())
-
-if n_live_folds == 0:
+if not trainer.fold_states:
     raise SystemExit("❌  no usable folds found!")
 
-# --------------------------------------------------------------------- #
-# --------------------------- POST-PROCESS ---------------------------- #
-# --------------------------------------------------------------------- #
-probs /= n_live_folds          # normalize by number of participating folds
-pred_ids = probs.argmax(-1)
-labels   = np.array(["Bearish", "Neutral", "Bullish"])
-VAL["Pred_Label"] = labels[pred_ids]
-VAL["Pred_Conf"]  = probs.max(-1) / np.maximum(probs.sum(-1), 1e-9)
+print("\n🔹 Running softmax-averaged ensemble …")
+VAL = trainer.ensemble_predict(VAL, weighted=True)
 
 VAL.to_csv("signals_val_2021.csv", index=False)
 print("✅  signals_val_2021.csv written")
@@ -222,7 +199,6 @@ if "Label" in VAL.columns:
     print(f"⚡  F1-score : {f1:.3f}")
 
     # --- extra diagnostics -------------------------------------------------
-    from sklearn.metrics import confusion_matrix
     cm = confusion_matrix(yt, yp, labels=[0,1,2])
     print("⚡  Confusion-matrix rows=truth, cols=pred")
     print(cm)
@@ -239,7 +215,7 @@ if "Label" in VAL.columns:
 # --------------------------------------------------------------------- #
 # -------------------------- SMALL SUMMARY --------------------------- #
 # --------------------------------------------------------------------- #
-print(f"🗳️  folds ensembled : {n_live_folds}")
+print(f"🗳️  folds ensembled : {len(trainer.fold_states)}")
 print(f"📄  daily rows      : {len(daily):,}")
 print("Pred distribution :", VAL['Pred_Label'].value_counts().to_dict())
 print(VAL['Pred_Label'].value_counts(normalize=True))
