@@ -1,107 +1,214 @@
-## trainer.py
-
-import tensorflow as tf
-import numpy as np
+# trainer.py  — hot-fix: ensure numeric hyper-parameters are cast to float/int
 import yaml
+import torch
+import numpy as np
+import pandas as pd
+from typing import Any, Dict
+from tqdm import tqdm
+
+from transformers import get_linear_schedule_with_warmup
+from transformers import DataCollatorWithPadding
+try:
+    from transformers.optimization import AdamW          # HF ≥4.40
+except ImportError:
+    from torch.optim import AdamW                        # fallback
+
+from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import GroupKFold
 from sklearn.utils import shuffle
-from typing import Any, Dict
-from model import Model  # Assuming Model class from model.py
-from market_labeler import MarketLabeler  # For accessing labeled data
+
+from model            import Model
+from market_labeler   import MarketLabeler
+
 
 class Trainer:
-    """Trainer class for handling the training process of BERT-based models."""
+    """Handle training of the BERT-based model with grouped CV."""
 
-    def __init__(self, model: Model, data: pd.DataFrame, config_path: str = 'config.yaml'):
-        """
-        Initialize the Trainer with a model, a labeled dataset, and configurations.
+    def __init__(self,
+                 model: Model,
+                 data: pd.DataFrame,
+                 config_path: str = "config.yaml") -> None:
 
-        Args:
-            model (Model): Instance of the model to be trained.
-            data (pd.DataFrame): Labeled dataset using market behaviors.
-            config_path (str): Path to the configuration YAML file.
-        """
-        # Load configuration
-        with open(config_path, 'r') as file:
-            self.config = yaml.safe_load(file)
-        
-        # Recording model and data
+        with open(config_path, "r") as f:
+            self.config = yaml.safe_load(f)
+
         self.model = model
-        self.data = data
+        self.data  = data
+        self.fold_states = []
 
-        # Extract training configurations
-        training_config = self.config['training']
-        self.learning_rate = training_config.get('learning_rate', 1e-5)
-        self.batch_size = training_config.get('batch_size', 12)
-        self.epochs = training_config.get('epochs', 2)
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.learning_rate)
-        self.warmup_steps = self.config['training'].get('warmup_steps', 0.1)
+        tcfg = self.config["training"]
+        # ---- cast YAML scalars safely -----------------------------------
+        self.learning_rate = float(tcfg.get("learning_rate", 1e-5))
+        self.batch_size    = int  (tcfg.get("batch_size",    12))
+        self.epochs        = int  (tcfg.get("epochs",        2))
+        self.warmup_frac   = float(tcfg.get("warmup_steps",  0.1))
+        # -----------------------------------------------------------------
 
+        self.optimizer = AdamW(self.model.bert_model.parameters(),
+                               lr=self.learning_rate)
+        self.scheduler = None
+
+    # ------------------------------------------------------------------  
+    # Public API  
+    # ------------------------------------------------------------------
     def train(self) -> None:
-        """Execute training over the defined number of epochs."""
+        """5-fold grouped CV + standard training loop."""
         data = self._prepare_data(self.data)
-        gkf = GroupKFold(n_splits=5)  # Use Group 5-fold cross-validation
 
-        for fold, (train_idx, val_idx) in enumerate(gkf.split(data, groups=data['group'])):
-            print(f"Fold {fold + 1}/{gkf.n_splits}")
+        gkf = GroupKFold(n_splits=5)
+        for fold, (tr_idx, va_idx) in enumerate(gkf.split(data,
+                                                         groups=data["group"])):
+            print(f"\n── Fold {fold+1}/{gkf.n_splits} ──")
+            tr_df, va_df = data.iloc[tr_idx], data.iloc[va_idx]
 
-            train_data = data.iloc[train_idx]
-            val_data = data.iloc[val_idx]
+            tr_loader = self._make_loader(tr_df, shuffle=True)
+            va_loader = self._make_loader(va_df, shuffle=False)
 
-            # Prepare TensorFlow datasets
-            train_dataset = self._create_tf_dataset(train_data)
-            val_dataset = self._create_tf_dataset(val_data)
+            tot_steps  = len(tr_loader) * self.epochs
+            self.scheduler = get_linear_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=int(tot_steps * self.warmup_frac),
+                num_training_steps=tot_steps,
+            )
+
+            self.model.freeze_layers(11)
+            self.model.bert_model.train()
 
             for epoch in range(self.epochs):
-                print(f"Epoch {epoch + 1}/{self.epochs}")
+                loop = tqdm(tr_loader, desc=f"fold {fold+1} epoch {epoch+1}/{self.epochs}",
+                leave=False)
+                print(f"  Epoch {epoch+1}/{self.epochs}")
+                self._train_one_epoch(loop)
+                self._evaluate(va_loader)
+            # keep a lightweight reference for later voting
+            self.fold_states.append({"model": self.model})
+        if hasattr(self, "fold_states"):
+            pred_df = cross_val_predict(self, data)
+            pred_df.to_csv("signals_per_tweet.csv", index=False)
+            print(f"✅ wrote {len(pred_df):,} rows → signals_per_tweet.csv")
+
+    # ------------------------------------------------------------------  
+    # Helpers  
+    # ------------------------------------------------------------------
+    def _prepare_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add TBL labels, Previous-Label feature and CV groups."""
+        lbl = MarketLabeler().label_data(df)
+        lbl["Previous Label"] = lbl["Label"].shift(1).fillna("Neutral")
+        lbl["group"]          = self._assign_groups(lbl)
+        return lbl
+
+    @staticmethod
+    def _assign_groups(df: pd.DataFrame) -> np.ndarray:
+        """Random 20 % time buckets so tweets close in time stay together."""
+        return shuffle(df.index.to_numpy()) // max(len(df) // 5, 1)
+
+
+    def _make_loader(self, df: pd.DataFrame, *, shuffle: bool) -> DataLoader:
+        feats, lbls = [], []
+        for _, row in df.iterrows():
+            tok = self.model.preprocess_input(
+                tweet_content=row["Tweet Content"],
+                rsi=row["RSI"],
+                roc=row["ROC"],
+                date=row["Tweet Date"].strftime("%Y-%m-%d"),
+                previous_label=row["Previous Label"],
+            )
+            # Remove token_type_ids and keep other tensors as is
+            if "token_type_ids" in tok:
+                del tok["token_type_ids"]
+            feats.append(tok)
+            lbls.append(
+                0 if row["Label"] == "Bearish"
+                else 1 if row["Label"] == "Neutral" else 2
+            )
+
+        class _DS(Dataset):
+            def __len__(self):  return len(lbls)
+            def __getitem__(self, i):
+                item = {k: v[0] for k, v in feats[i].items()}  # Remove batch dimension
+                item["labels"] = torch.tensor(lbls[i])
+                return item
+
+        return DataLoader(
+            _DS(),
+            batch_size=self.batch_size,
+            shuffle=shuffle,
+        )
+
+
+
+    def _train_one_epoch(self, loader: DataLoader) -> None:
+        for step, batch in enumerate(loader):
+            if step == 0:                    # print once per epoch
+                print("vocab_size:", self.model.tokenizer.vocab_size)
+                print(" BATCH KEYS:", batch.keys())
+                print("  input_ids  max id:", batch["input_ids"].max().item())
+                print("  input_ids  shape:", batch["input_ids"].shape)
+                # If you have an attention_mask, print its dtype & shape:
+                if "attention_mask" in batch:
+                    print("  attn_mask shape:", batch["attention_mask"].shape)
+            lbls  = batch.pop("labels")
+            outs  = self.model.bert_model(**batch)
+            loss  = torch.nn.functional.cross_entropy(outs.logits, lbls)
+            loss.backward()
+            self.optimizer.step();  self.scheduler.step()
+            self.optimizer.zero_grad()
+            if step % 10 == 0:
+                print(f"    step {step:<4}  loss {loss.item():.4f}")
+
+    def _evaluate(self, loader: DataLoader) -> None:
+        self.model.bert_model.eval()
+        correct = total = 0
+        with torch.no_grad():
+            for batch in loader:
+                lbls = batch.pop("labels")
+                preds = self.model.bert_model(**batch).logits.argmax(dim=-1)
+                correct += (preds == lbls).sum().item()
+                total   += lbls.size(0)
+        acc = correct / total if total else 0
+        print(f"  → val acc: {acc:.4f}")
+        self.model.bert_model.train()
+
+def cross_val_predict(trainer: "Trainer",
+                      data: pd.DataFrame,
+                      cfg_path: str = "config.yaml") -> pd.DataFrame:
+    """
+    Run the already-trained 5 fold models on *all* data and return
+    majority-vote label + confidence (mean softmax prob of winning class).
+    """
+    from collections import defaultdict
+    votes   = defaultdict(list)   # idx → [class_ids]
+    confs   = defaultdict(list)   # idx → [prob_of_pred]
+
+    for fold_id, fold_state in enumerate(trainer.fold_states):
+        model = fold_state["model"]            # reuse fine-tuned weights
+        loader = trainer._make_loader(data, shuffle=False)
+
+        model.bert_model.eval()
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(loader):
+                # Get the actual indices for this batch
+                start_idx = batch_idx * trainer.batch_size
+                indices = range(start_idx, min(start_idx + len(batch["input_ids"]), len(data)))
                 
-                # Training Loop
-                for step, (inputs, labels) in enumerate(train_dataset):
-                    with tf.GradientTape() as tape:
-                        outputs = self.model.forward(inputs)
-                        loss = self._compute_loss(outputs, labels)
+                logits = model.bert_model(**{k: v for k, v in batch.items()
+                                             if k != "labels"}).logits
+                probs  = torch.softmax(logits, dim=-1)
+                preds  = probs.argmax(dim=-1)
+                
+                # Process each sample in the batch
+                for i, (idx, pred) in enumerate(zip(indices, preds)):
+                    votes[idx].append(pred.item())
+                    confs[idx].append(probs[i, pred].item())
 
-                    gradients = tape.gradient(loss, self.model.bert_model.trainable_variables)
-                    self.optimizer.apply_gradients(zip(gradients, self.model.bert_model.trainable_variables))
+    # majority + avg-confidence
+    maj_lbl = {i: max(set(votes[i]), key=votes[i].count) for i in votes}
+    maj_cnf = {i: np.mean(confs[i]) for i in confs}
 
-                    if step % 10 == 0:
-                        print(f"Step {step}, Loss: {loss.numpy()}")
-
-                # Validation
-                self._evaluate(val_dataset)
-
-    def _prepare_data(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Prepare data for training including label labeling."""
-        labeler = MarketLabeler()
-        labeled_data = labeler.label_data(data)
-        labeled_data['group'] = self._assign_groups(labeled_data)
-        return labeled_data
-
-    def _assign_groups(self, data: pd.DataFrame) -> np.ndarray:
-        """Assign groups for cross-validation to prevent leakage."""
-        return shuffle(data.index.to_numpy()) // (len(data) // 5)
-
-    def _create_tf_dataset(self, data: pd.DataFrame) -> tf.data.Dataset:
-        """Convert DataFrame into a TensorFlow dataset suitable for training."""
-        features = data[['Tweet Content', 'RSI', 'ROC', 'Tweet Date', 'Previous Label']].to_dict('records')
-        labels = data['Label'].apply(lambda x: 0 if x == 'Bearish' else (1 if x == 'Neutral' else 2)).values
-        
-        # Encode features and labels as a tf.data.Dataset
-        dataset = tf.data.Dataset.from_tensor_slices((features, labels))
-        dataset = dataset.shuffle(buffer_size=1024).batch(self.batch_size)
-        return dataset
-
-    def _compute_loss(self, logits: tf.Tensor, labels: np.ndarray) -> tf.Tensor:
-        """Compute the loss using SparseCategoricalCrossentropy."""
-        loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
-        return loss_fn(labels, logits)
-
-    def _evaluate(self, dataset: tf.data.Dataset) -> None:
-        """Evaluate the model on validation dataset."""
-        accuracy_metric = tf.keras.metrics.SparseCategoricalAccuracy()
-
-        for inputs, labels in dataset:
-            predictions = self.model.forward(inputs)
-            accuracy_metric.update_state(labels, predictions)
-
-        print(f"Validation Accuracy: {accuracy_metric.result().numpy()}")
+    out = data.copy()
+    out["Pred_Label"]   = out.index.map(maj_lbl)
+    out["Pred_Conf"]    = out.index.map(maj_cnf)
+    out["Pred_Label"]   = out["Pred_Label"].map({0: "Bearish",
+                                                 1: "Neutral",
+                                                 2: "Bullish"})
+    return out

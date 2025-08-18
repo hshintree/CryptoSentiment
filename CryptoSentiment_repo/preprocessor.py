@@ -1,66 +1,89 @@
-## preprocessor.py
-
+import re
 import pandas as pd
 import numpy as np
 import yaml
 from typing import Dict
-from sklearn.preprocessing import MinMaxScaler
-
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from nltk.stem import WordNetLemmatizer
+import emoji
 
 class Preprocessor:
     def __init__(self, config_path: str = 'config.yaml'):
         # Load configuration file for preprocessing settings
         with open(config_path, 'r') as file:
             self.config = yaml.safe_load(file)
-
-        # Extract preprocessing settings
         self.settings = self.config['data']['preprocessing_steps']
-        self.rsi_threshold = self.config['data'].get('rsi_threshold', [30, 70])
+        self.rsi_threshold   = self.config['data'].get('rsi_threshold', [30, 70])
         self.roc_window_length = self.config['data'].get('roc_window_length', 8)
+        # lemmatizer once
+        if self.settings.get('lemmatization', False):
+            self.lemmatizer = WordNetLemmatizer()
+
+    def _process_volume(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Process volume data to compute both z-score and log-volume.
+        Uses a rolling window for z-score calculation to account for time-varying volume patterns.
+        """
+        if 'Volume' not in df.columns:
+            return df
+            
+        # Compute log volume
+        df['log_volume'] = np.log1p(df['Volume'])
+        
+        return df
 
     def preprocess(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Preprocess the data according to the specified steps"""
-
-        # Text Normalization
-        if self.settings['text_normalization']:
-            data['Tweet Content'] = data['Tweet Content'].str.lower()
-
-        if self.settings['remove_urls']:
-            data['Tweet Content'] = data['Tweet Content'].str.replace(r'http\S+|www.\S+', '', regex=True)
-
-        if self.settings['remove_user_ids']:
-            data['Tweet Content'] = data['Tweet Content'].str.replace(r'@\w+', '', regex=True)
+        """Preprocess the data according to the specified steps."""
+        # Make a copy to avoid modifying the original
+        data = data.copy()
         
-        if self.settings['remove_punctuation']:
-            data['Tweet Content'] = data['Tweet Content'].str.replace(r'[^\w\s]', '', regex=True)
+        ## 1) Text cleanup & normalization
+        def clean_text(text: str) -> str:
+            # 1a) unify case
+            txt = text.lower()
+            # 1b) strip URLs & @users
+            txt = re.sub(r'http\S+|www\.\S+|@\w+', '', txt)
+            # 1c) extract emojis (keep them as words)
+            emojis = ' '.join(emoji.demojize(txt).split())
+            # 1d) remove promotional markers (e.g. "buy now", "giveaway")
+            promo_pattern = r'\b(buy now|giveaway|promo|free\s+gift)\b'
+            emojis = re.sub(promo_pattern, '', emojis)
+            # 1e) strip punctuation but keep hashtags
+            emojis = re.sub(r'[^#\w\s]', '', emojis)
+            # 1f) lemmatize
+            if self.settings.get('lemmatization', False):
+                tokens = []
+                for w in emojis.split():
+                    # preserve hashtags as tokens, but strip "#" before lemmatizing
+                    if w.startswith('#'):
+                        base = w[1:]
+                        tokens.append('#' + self.lemmatizer.lemmatize(base))
+                    else:
+                        tokens.append(self.lemmatizer.lemmatize(w))
+                emojis = ' '.join(tokens)
+            return emojis
 
-        if self.settings['lemmatization']:
-            # Assuming lemmatization method is defined somewhere else
-            from nltk.stem import WordNetLemmatizer
-            lemmatizer = WordNetLemmatizer()
-            data['Tweet Content'] = data['Tweet Content'].apply(
-                lambda x: ' '.join([lemmatizer.lemmatize(word) for word in x.split()])
-            )
+        data['Tweet Content'] = data['Tweet Content'].astype(str).apply(clean_text)
 
-        # Ensure 'Close' price exists in case technical indicators are calculated
+        ## 2) Technical indicators
         if 'Close' in data.columns:
-            # RSI calculation
             delta = data['Close'].diff(1)
-            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            gain = delta.clip(lower=0).rolling(window=14).mean()
+            loss = (-delta).clip(lower=0).rolling(window=14).mean()
             rs = gain / loss
             data['RSI'] = 100 - (100 / (1 + rs))
-
-            # Rate of Change (ROC) calculation
             data['ROC'] = data['Close'].pct_change(periods=self.roc_window_length) * 100
 
-        # Handle missing values
-        data.fillna(method='ffill', inplace=True)
-        data.fillna(method='bfill', inplace=True)
+        ## 3) Process volume data
+        data = self._process_volume(data)
 
-        # Min-Max normalizing tech indicators for embedding in prompts if necessary
-        scaler = MinMaxScaler()
-        if 'RSI' in data.columns and 'ROC' in data.columns:
-            data[['RSI', 'ROC']] = scaler.fit_transform(data[['RSI', 'ROC']])
+        ## 4) Fill missing, scale RSI/ROC
+        # Use forward fill first, then backward fill for any remaining NaNs
+        data = data.ffill().bfill()
+        
+        # Scale RSI/ROC if they exist
+        if {'RSI','ROC'}.issubset(data.columns):
+            scaler = MinMaxScaler()
+            data[['RSI','ROC']] = scaler.fit_transform(data[['RSI','ROC']])
 
         return data

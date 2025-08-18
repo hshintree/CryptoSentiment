@@ -1,69 +1,96 @@
-## model.py
+"""model.py – dynamic max_length fix
+• Now reads config.max_position_embeddings at runtime
+• Caps token length to the *minimum* of 256 and max_position_embeddings
+"""
 
-import tensorflow as tf
-from transformers import TFBertModel, BertTokenizer
 import yaml
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 class Model:
-    """Model class for creating and managing a BERT-based language model for financial sentiment analysis."""
+    """BERT-based model wrapper for financial sentiment analysis."""
 
-    def __init__(self, params: dict):
-        """
-        Initialize the BERT model for financial sentiment analysis.
-        
-        Args:
-            params (dict): Contains configurations such as model type and prompt tuning settings.
-        """
-        # Load configuration file for model settings
-        with open('config.yaml', 'r') as file:
-            config = yaml.safe_load(file)
+    def __init__(self, params: dict | str):
+        if isinstance(params, str):
+            import pathlib
+            with open(pathlib.Path(params)) as f:
+                params = yaml.safe_load(f)["model"]
 
-        # Retrieve settings from configuration
-        self.model_type = params.get('type', 'CryptoBERT')
-        self.prompt_tuning = params.get('prompt_tuning', True)
-        
-        # Initialize the tokenizer and the model based on the type specified
-        if self.model_type == 'CryptoBERT':
-            self.tokenizer = BertTokenizer.from_pretrained('vinai/bertweet-base')  # Example model, can be replaced
-            self.bert_model = TFBertModel.from_pretrained('vinai/bertweet-base')
-        elif self.model_type == 'FinBERT':
-            self.tokenizer = BertTokenizer.from_pretrained('yiyanghkust/finbert-tone')  # Example model, can be replaced
-            self.bert_model = TFBertModel.from_pretrained('yiyanghkust/finbert-tone')
+        self.model_type       = params.get("type", "CryptoBERT")
+        self._n_freeze_layers = int(params.get("freeze_layers", 11))
+
+        if self.model_type == "CryptoBERT":
+            ckpt = "vinai/bertweet-base"
+        elif self.model_type == "FinBERT":
+            ckpt = "yiyanghkust/finbert-tone"
         else:
-            raise ValueError("Unsupported model type. Choose 'CryptoBERT' or 'FinBERT'.")
+            raise ValueError("Unsupported model type – choose CryptoBERT or FinBERT")
 
-    def preprocess_input(self, tweet_content: str, rsi: float, roc: float, date: str, previous_label: str) -> dict:
-        """
-        Preprocess input data by embedding market context into text.
-        
-        Args:
-            tweet_content (str): The raw tweet content.
-            rsi (float): Relative Strength Index value.
-            roc (float): Rate of Change value.
-            date (str): Date as a string.
-            previous_label (str): Label from previous prediction.
+        self.tokenizer  = AutoTokenizer.from_pretrained(ckpt)
+        self.bert_model = AutoModelForSequenceClassification.from_pretrained(
+            ckpt, num_labels=3
+        )
 
-        Returns:
-            dict: Encoded inputs suitable for model.
+    def preprocess_input(
+        self,
+        *,
+        tweet_content: str,
+        rsi: float,
+        roc: float,
+        date: str,
+        previous_label: str,
+        log_volume: float | None = None,
+    ) -> dict:
         """
-        # Create a prompt with market-related context
-        prompt = f"Date: {date}, Previous Label: {previous_label}, ROC: {roc}, RSI: {rsi}, Tweet: {tweet_content}"
+        Tokenise prompt and return fixed-length tensors.
+
+        Dynamically queries the model's max_position_embeddings so we
+        never exceed the embedding-matrix range, even if it's <256.
+        """
+        # Include volume info in prompt if available
+        volume_info = ""
+        if log_volume is not None:
+            volume_info = f" | Vol(log):{log_volume:.2f}"
+            
+        prompt = (
+            f"Date:{date} | Prev:{previous_label} | "
+            f"ROC:{roc:.4f} | RSI:{rsi:.2f}{volume_info} | Tweet:{tweet_content}"
+        )
+        # determine safe length
+        max_pos = self.bert_model.config.max_position_embeddings
+        max_len = min(128, max_pos)  # Reduced from 256 to 128 to be safe
+
+        # Get tokenizer output
+        tokenized = self.tokenizer(
+            prompt,
+            padding="max_length",
+            truncation=True,
+            max_length=max_len,
+            return_tensors="pt",
+        )
         
-        # Encode the text with tokenizer
-        inputs = self.tokenizer(prompt, return_tensors="tf", padding=True, truncation=True)
+        # Create position IDs
+        position_ids = torch.arange(max_len, dtype=torch.long)
+        position_ids = position_ids.unsqueeze(0).expand_as(tokenized["input_ids"])
+        tokenized["position_ids"] = position_ids
         
-        return inputs
+        # Add numeric features if available
+        if log_volume is not None:
+            tokenized["numeric_features"] = torch.tensor([[rsi, roc, log_volume]], dtype=torch.float)
+        else:
+            tokenized["numeric_features"] = torch.tensor([[rsi, roc]], dtype=torch.float)
+        
+        return tokenized
 
     def forward(self, inputs):
-        """
-        Perform a forward pass through the model.
-        
-        Args:
-            inputs (dict): Tokenized inputs as tensors.
+        """Forward pass returning logits."""
+        return self.bert_model(**inputs).logits
 
-        Returns:
-            tf.Tensor: Output logits from the model.
-        """
-        # Obtain model output
-        outputs = self.bert_model(inputs)
-        return outputs.last_hidden_state
+    def freeze_layers(self, freeze_until: int | None = None) -> None:
+        """Freeze lower transformer blocks."""
+        if freeze_until is None:
+            freeze_until = self._n_freeze_layers
+        encoder = self.bert_model.base_model.encoder
+        for layer in encoder.layer[:freeze_until]:
+            for p in layer.parameters():
+                p.requires_grad = False
