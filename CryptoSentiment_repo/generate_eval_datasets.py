@@ -12,7 +12,7 @@ This script:
 Usage:
     python generate_eval_datasets.py
 """
-
+import argparse
 import pandas as pd, numpy as np, warnings
 import os
 from pathlib import Path
@@ -186,7 +186,7 @@ def validate_dataset_characteristics(datasets, verbose=True):
     return validation_results
 
 
-def save_datasets_to_csv(datasets, data_dir, timestamp=None):
+def save_datasets_to_csv(datasets, data_dir, timestamp=None, *, write: bool = True, timestamped: bool = False):
     """
     Save all datasets to CSV files with descriptive names.
     
@@ -194,10 +194,16 @@ def save_datasets_to_csv(datasets, data_dir, timestamp=None):
         datasets: Dictionary from EvalLoaderComplete.create_eval_datasets()
         data_dir: Path object for data directory
         timestamp: Optional timestamp string for file naming
+        write: Whether to actually write CSV files
+        timestamped: Whether to include timestamp in filenames
         
     Returns:
         Dict with saved file paths
     """
+    if not write:
+        print("⚠️ Skipping CSV writes (--no-save enabled)")
+        return {}
+
     if timestamp is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
@@ -209,8 +215,8 @@ def save_datasets_to_csv(datasets, data_dir, timestamp=None):
     
     # Main datasets
     files_to_save = [
-        ("ea_full", "#1train.csv", "Ea training dataset (year 2020)"),
-        ("eb_full", "#2val.csv", "Eb evaluation dataset (events)")
+        ("ea_full", f"#1train{'_' + timestamp if timestamped else ''}.csv", "Ea training dataset (year 2020)"),
+        ("eb_full", f"#2val{'_' + timestamp if timestamped else ''}.csv",   "Eb evaluation dataset (events)")
     ]
     
     for key, filename, description in files_to_save:
@@ -301,6 +307,11 @@ def generate_summary_report(datasets, validation_results, saved_files, timestamp
 
 def main():
     """Main function to generate, validate, and save evaluation datasets."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-save", action="store_true", help="Do not write CSVs to data/ (print only)")
+    parser.add_argument("--timestamped", action="store_true", help="Append timestamp to output CSV filenames and report")
+    args = parser.parse_args()
+
     print("🚀 Starting Evaluation Dataset Generation")
     print("="*60)
     
@@ -325,15 +336,18 @@ def main():
         print("\n🔍 Validating dataset characteristics...")
         validation_results = validate_dataset_characteristics(datasets, verbose=True)
         
-        # 3. Save to CSV files
+        # 3. Save to CSV files (controlled by flags)
         print("\n💾 Saving datasets to CSV files...")
-        saved_files = save_datasets_to_csv(datasets, data_dir, timestamp)
+        saved_files = save_datasets_to_csv(
+            datasets, data_dir, timestamp, write=(not args.no_save), timestamped=args.timestamped
+        )
         
         # 4. Generate summary report
         summary_report = generate_summary_report(datasets, validation_results, saved_files, timestamp)
         
-        # Save summary report
-        report_path = data_dir / f"generation_report_{timestamp}.txt"
+        # Save summary report (timestamped only if requested)
+        report_name = f"generation_report_{timestamp}.txt" if args.timestamped else "generation_report.txt"
+        report_path = data_dir / report_name
         with open(report_path, 'w') as f:
             f.write(summary_report)
         

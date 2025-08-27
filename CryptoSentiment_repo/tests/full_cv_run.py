@@ -9,6 +9,7 @@ from 2015-2019 & 2021-2023, paper-exact configuration).
 • single "best-epoch" checkpoint per fold
 """
 
+import argparse
 import yaml
 import pandas as pd
 from pathlib import Path
@@ -23,6 +24,11 @@ from trainer import Trainer
 from sklearn.metrics import (accuracy_score,
                              precision_recall_fscore_support)
 from glob import glob
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--no-save", action="store_true", help="Do not write CSV artifacts (signals_*.csv, *_daily_signals.csv)")
+ap.add_argument("--timestamped", action="store_true", help="Append a timestamp suffix to CSV artifact filenames")
+args = ap.parse_args()
 
 # ── 1. Configuration ───────────────────────────────────────────
 # ── paths ──────────────────────────────────────────────────────────
@@ -109,27 +115,6 @@ for name, buckets in [("RSI_bucket", rsib), ("ROC_bucket", rocb)]:
     print(f"   χ²({name:11s}) = {chi2:6.1f}   p-value = {p:.4f}")
 
 print("─────────────────────────────────────────────────────────────")
-
-# # ── Paper-style indicator correlations on the *full* EB archive ──────────
-# print("\n🔍 Paper-style indicator correlations (daily aggregation on full EB)")
-# from preprocessor import Preprocessor
-
-# pre = Preprocessor(CFG)
-# eb_proc = pre.fit_transform(eb.copy())        # adds RSI_raw / ROC_raw
-
-# _code = {"Bearish": 0, "Neutral": 1, "Bullish": 2}
-# daily = (
-#     eb_proc
-#       .groupby(eb_proc["Tweet Date"].dt.normalize())
-#       .agg({"RSI_raw": "mean",
-#             "ROC_raw": "mean",
-#             "Label": "first"})
-#       .replace(_code)
-# )
-# corr = daily.corr().iloc[:-1, -1]   # each feature vs ground-truth label
-# for feat, rho in corr.items():
-#     print(f"   ρ({feat:14s} , Label) = {rho:+.3f}")
-# print("─────────────────────────────────────────────────────────────")
 
 # Verify temporal separation
 ea_years = sorted(ea['Tweet Date'].dt.year.unique())
@@ -232,6 +217,8 @@ print(f"\n" + "="*70)
 print(f"🔮 OUT-OF-SAMPLE EVALUATION ON EB (events 2015-19 & 2021-23)")
 print(f"="*70)
 
+suffix = f"_{timestamp}" if args.timestamped else ""
+
 if trainer.fold_states:
     print("🔮 Generating predictions on EB evaluation set…")
     
@@ -239,8 +226,9 @@ if trainer.fold_states:
     sig_eb = trainer.ensemble_predict(eb, weighted=True)
     
     # Save per-tweet predictions
-    sig_eb.to_csv("signals_eb.csv", index=False)
-    print("✓ Saved per-tweet predictions → signals_eb.csv")
+    if not args.no_save:
+        sig_eb.to_csv(f"signals_eb{suffix}.csv", index=False)
+        print(f"✓ Saved per-tweet predictions → signals_eb{suffix}.csv")
     
     # Generate daily signals via majority vote
     print("  📅 Aggregating daily signals...")
@@ -250,8 +238,9 @@ if trainer.fold_states:
         .sort_index()
         .rename("Daily_Signal")
     )
-    daily_eb.to_csv("eb_daily_signals.csv")
-    print("✓ Saved per-day signals     → eb_daily_signals.csv")
+    if not args.no_save:
+        daily_eb.to_csv(f"eb_daily_signals{suffix}.csv")
+        print(f"✓ Saved per-day signals     → eb_daily_signals{suffix}.csv")
     
     # Summary statistics
     eb_pred_dist    = sig_eb['Pred_Label'].value_counts()
@@ -274,8 +263,7 @@ if trainer.fold_states:
         print(f"  Precision: {prec:.3f}")
         print(f"  Recall   : {rec:.3f}")
         print(f"  F1-score : {f1:.3f}")
-
-        # --------- quick leakage sanity check ----------------------------
+        
         if acc > 0.90:
             print("  ⚠️  Very high accuracy - check for data leakage!")
         elif acc > 0.60:
@@ -292,8 +280,9 @@ if trainer.fold_states:
     sig_ea = trainer.ensemble_predict(ea, weighted=True)
     
     # Save per-tweet predictions for EA
-    sig_ea.to_csv("signals_ea.csv", index=False)
-    print("✓ Saved per-tweet predictions → signals_ea.csv")
+    if not args.no_save:
+        sig_ea.to_csv(f"signals_ea{suffix}.csv", index=False)
+        print(f"✓ Saved per-tweet predictions → signals_ea{suffix}.csv")
     
     # Generate daily signals via majority vote for EA
     print("  📅 Aggregating daily signals...")
@@ -303,8 +292,9 @@ if trainer.fold_states:
         .sort_index()
         .rename("Daily_Signal")
     )
-    daily_ea.to_csv("ea_daily_signals.csv")
-    print("✓ Saved per-day signals     → ea_daily_signals.csv")
+    if not args.no_save:
+        daily_ea.to_csv(f"ea_daily_signals{suffix}.csv")
+        print(f"✓ Saved per-day signals     → ea_daily_signals{suffix}.csv")
     
     # Summary statistics for EA
     ea_pred_dist    = sig_ea['Pred_Label'].value_counts()
@@ -327,8 +317,7 @@ if trainer.fold_states:
         print(f"  Precision: {prec:.3f}")
         print(f"  Recall   : {rec:.3f}")
         print(f"  F1-score : {f1:.3f}")
-
-        # --------- quick leakage sanity check ----------------------------
+        
         if acc > 0.90:
             print("  ⚠️  Very high accuracy - check for data leakage!")
         elif acc > 0.60:
@@ -343,9 +332,10 @@ print(f"🎉 FULL CV RUN COMPLETED!")
 print(f"="*70)
 print(f"📁 Files generated:")
 print(f"  • Model checkpoints: models/ea_2019-2020_{timestamp}/")
-print(f"  • EA  predictions: signals_ea.csv")
-print(f"  • EA  daily signals: ea_daily_signals.csv")
-print(f"  • EB  predictions: signals_eb.csv")
-print(f"  • EB  daily signals: eb_daily_signals.csv")
+if not args.no_save:
+    print(f"  • EA  predictions: signals_ea{suffix}.csv")
+    print(f"  • EA  daily signals: ea_daily_signals{suffix}.csv")
+    print(f"  • EB  predictions: signals_eb{suffix}.csv")
+    print(f"  • EB  daily signals: eb_daily_signals{suffix}.csv")
 print(f"  • Training metrics: training_metrics.json")
 print(f"\n✅ Ready for paper results analysis!") 

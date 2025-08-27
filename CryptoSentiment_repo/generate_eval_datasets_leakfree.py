@@ -79,6 +79,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--raw", required=True, help="combined_dataset_raw.csv")
     p.add_argument("--cfg", default="config.yaml")
+    p.add_argument("--no-save", action="store_true", help="Do not write CSVs to data/")
+    p.add_argument("--timestamped", action="store_true", help="Append timestamp to output filenames")
     args = p.parse_args()
 
     raw = Path(args.raw)
@@ -98,9 +100,15 @@ def main():
     print(f"Eb 2015‑18/22‑23: {len(eb):,} rows  | dist: {eb['Label'].value_counts().to_dict()}")
 
     out_dir = Path("data"); out_dir.mkdir(exist_ok=True)
-    ea.to_csv(out_dir/"#2train.csv", index=False)
-    eb.to_csv(out_dir/"#3val.csv",   index=False)
-    print("💾 Saved: #2train.csv  #3val.csv")
+    if args.no_save:
+        print("⚠️ Skipping CSV writes (--no-save enabled)")
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S") if args.timestamped else None
+        ea_name = f"#2train_{ts}.csv" if ts else "#2train.csv"
+        eb_name = f"#3val_{ts}.csv"   if ts else "#3val.csv"
+        ea.to_csv(out_dir / ea_name, index=False)
+        eb.to_csv(out_dir / eb_name, index=False)
+        print(f"💾 Saved: {ea_name}  {eb_name}")
 
     # Quick rho sanity
     for name, d in [("train", ea), ("val", eb)]:
