@@ -9,8 +9,8 @@ import json
 import pandas as pd
 import yaml
 from pathlib import Path
-from model import Model
-from trainer import Trainer
+from gpu_scripts.model import Model
+from gpu_scripts.trainer import Trainer
 
 def run_leak_smoke_test():
     print("🧪 LEAK SMOKE TEST")
@@ -64,8 +64,8 @@ def run_leak_smoke_test():
         trainer_baseline.batch_size = 8
         
         # Force global preprocessing/labeling (the old leaky way)
-        from preprocessor import Preprocessor
-        from market_labeler_ewma import MarketLabelerTBL
+        from gpu_scripts.preprocessor import Preprocessor
+        from gpu_scripts.market_labeler_ewma import MarketLabelerTBL
         
         # Global preprocessing (leaky)
         pp = Preprocessor("config.yaml")

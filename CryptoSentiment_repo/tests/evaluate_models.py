@@ -26,8 +26,8 @@ from sklearn.metrics import (accuracy_score,
                              confusion_matrix)
 
 # ── Crypto-Sentiment code -----------------
-from model   import Model
-from trainer import Trainer
+from gpu_scripts.model   import Model
+from gpu_scripts.trainer import Trainer
 
 # --------------------------------------------------------------------- #
 # -------------------------- CLI ARGUMENTS ---------------------------- #

@@ -25,9 +25,9 @@ from transformers import (AutoTokenizer,
                           AutoModelForSequenceClassification)
 from sklearn.metrics import (accuracy_score,
                              precision_recall_fscore_support)
-from preprocessor import Preprocessor
-from market_labeler_ewma import MarketLabelerTBL, MarketFeatureGenerator
-from model import Model                       # only for preprocess_input
+from gpu_scripts.preprocessor import Preprocessor
+from gpu_scripts.market_labeler_ewma import MarketLabelerTBL, MarketFeatureGenerator
+from gpu_scripts.model import Model                       # only for preprocess_input
 
 # ------------------------------------------------------------------ #
 # 1)  FIT PREPROCESSOR ON THE *TRAINING* SET ONLY                    #

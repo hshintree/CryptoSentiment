@@ -7,7 +7,7 @@ for res in ('wordnet', 'omw-1.4'):
     except LookupError: nltk.download(res, quiet=True)
 
 from dataset_loader import DatasetLoader
-from preprocessor    import Preprocessor
+from gpu_scripts.preprocessor    import Preprocessor
 from market_labeler  import MarketLabeler
 
 dl  = DatasetLoader("config.yaml")

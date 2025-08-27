@@ -8,8 +8,8 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
-from model import Model
-from trainer import Trainer, cross_val_predict
+from gpu_scripts.model import Model
+from gpu_scripts.trainer import Trainer, cross_val_predict
 
 def test_cross_val_predict():
     print("🧪 CROSS_VAL_PREDICT SMOKETEST")

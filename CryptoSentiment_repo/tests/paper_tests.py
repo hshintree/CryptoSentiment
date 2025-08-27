@@ -8,10 +8,10 @@ import argparse
 import os
 import yaml
 import pandas as pd
-from model       import Model
-from trainer     import Trainer, cross_val_predict          # :contentReference[oaicite:0]{index=0}
-from preprocessor import Preprocessor
-from market_labeler_ewma import MarketLabelerTBL         # your enhanced labeler
+from gpu_scripts.model       import Model
+from gpu_scripts.trainer     import Trainer, cross_val_predict          # :contentReference[oaicite:0]{index=0}
+from gpu_scripts.preprocessor import Preprocessor
+from gpu_scripts.market_labeler_ewma import MarketLabelerTBL         # your enhanced labeler
 from pathlib import Path
 from datetime import datetime
 import time, datetime

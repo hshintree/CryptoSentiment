@@ -10,8 +10,8 @@ from collections import Counter
 import matplotlib.pyplot as plt
 import sys
 sys.path.append('..')
-from preprocessor import Preprocessor
-from market_labeler_ewma import MarketLabelerTBL
+from gpu_scripts.preprocessor import Preprocessor
+from gpu_scripts.market_labeler_ewma import MarketLabelerTBL
 
 def diagnose_dataset():
     print("🔍 DATASET DIAGNOSIS")

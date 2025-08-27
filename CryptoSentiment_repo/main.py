@@ -6,10 +6,10 @@ import yaml
 import pandas as pd
 
 from dataset_loader import DatasetLoader
-from preprocessor import Preprocessor
+from gpu_scripts.preprocessor import Preprocessor
 from market_labeler import MarketLabeler
-from model import Model
-from trainer import Trainer
+from gpu_scripts.model import Model
+from gpu_scripts.trainer import Trainer
 from evaluation import Evaluation
 from signal_generator import SignalGenerator
 from backtester import Backtester

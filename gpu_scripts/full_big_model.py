@@ -5,8 +5,8 @@ run_single.py  –  train once on #1train.csv, evaluate on EA & EB
 
 from pathlib import Path
 import pandas as pd, yaml, torch, datetime as dt
-from train_one import SingleTrainer, save_model, _coerce_dates, plot_training_history
-from model          import Model
+from gpu_scripts.train_one import SingleTrainer, save_model, _coerce_dates, plot_training_history
+from gpu_scripts.model          import Model
 
 CFG       = "config.yaml"
 EA_CSV    = Path("data/#1train.csv")   # 2020 tweets

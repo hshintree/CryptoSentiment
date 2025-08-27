@@ -5,7 +5,7 @@ import pandas as pd
 import yaml
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from typing import Dict, Any
-from model import Model  # Assuming Model class from model.py
+from gpu_scripts.model import Model  # Assuming Model class from model.py
 
 class Evaluation:
     """Class to evaluate the performance of a trained language model on market-derived labeled data."""

@@ -35,7 +35,7 @@ import sys
 
 import pandas as pd
 import numpy as np
-from model import Model
+from gpu_scripts.model import Model
 
 def main():
     # 1) load your tokenizer

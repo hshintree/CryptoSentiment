@@ -14,7 +14,7 @@ import yaml
 from sklearn.model_selection import TimeSeriesSplit
 
 from dataset_loader import DatasetLoader
-from preprocessor import Preprocessor
+from gpu_scripts.preprocessor import Preprocessor
 from market_labeler import MarketLabeler
 
 

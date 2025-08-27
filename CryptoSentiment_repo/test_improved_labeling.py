@@ -5,7 +5,7 @@ Loads the already-saved dataset to avoid waiting for data loading.
 """
 
 import pandas as pd
-from market_labeler_ewma import MarketLabelerTBL
+from gpu_scripts.market_labeler_ewma import MarketLabelerTBL
 
 def test_improved_labeling():
     print('🔍 TESTING IMPROVED LABELING WITH CORRECTED VOLATILITY MULTIPLIERS...')

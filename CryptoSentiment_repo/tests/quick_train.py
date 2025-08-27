@@ -10,10 +10,10 @@ Updated cross-fold validation test with temporal grouping fix.
 import yaml
 import torch
 import pandas as pd
-from preprocessor import Preprocessor
-from market_labeler_ewma import MarketLabelerTBL
-from model import Model
-from trainer import Trainer, cross_val_predict
+from gpu_scripts.preprocessor import Preprocessor
+from gpu_scripts.market_labeler_ewma import MarketLabelerTBL
+from gpu_scripts.model import Model
+from gpu_scripts.trainer import Trainer, cross_val_predict
 
 def test_temporal_grouping():
     print("🧪 TEMPORAL GROUPING TEST")

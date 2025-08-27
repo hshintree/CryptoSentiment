@@ -22,9 +22,9 @@ from transformers import get_cosine_schedule_with_warmup
 from torch.utils.data import DataLoader, Dataset
 from torch import nn
 
-from model                 import Model
-from preprocessor          import Preprocessor
-from market_labeler_ewma   import MarketLabelerTBL, MarketFeatureGenerator
+from gpu_scripts.model                 import Model
+from gpu_scripts.preprocessor          import Preprocessor
+from gpu_scripts.market_labeler_ewma   import MarketLabelerTBL, MarketFeatureGenerator
 
 # --------------------------------------------------------------------- #
 #                         ─── Helper functions ───                       #

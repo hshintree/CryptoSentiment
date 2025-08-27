@@ -4,7 +4,7 @@ Quick test script to verify the model forward pass works without device/dtype er
 """
 
 import torch
-from model import Model
+from gpu_scripts.model import Model
 
 def test_model():
     print("Testing Model with prompt-tuning...")

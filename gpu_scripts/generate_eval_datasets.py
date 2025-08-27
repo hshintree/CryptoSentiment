@@ -17,7 +17,7 @@ import pandas as pd, numpy as np, warnings
 import os
 from pathlib import Path
 from datetime import datetime
-from eval_loader_complete import EvalLoaderComplete
+from gpu_scripts.eval_loader_complete import EvalLoaderComplete
 
 # make pandas & sklearn shut up
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)

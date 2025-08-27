@@ -58,10 +58,10 @@ from peft import get_peft_model, LoraConfig
 
 # Add the parent directory to path to import our existing modules
 sys.path.append(str(Path(__file__).parent))
-from preprocessor import Preprocessor
-from market_labeler_ewma import MarketLabelerTBL, MarketFeatureGenerator
-from model import Model
-from train_one import _coerce_dates
+from gpu_scripts.preprocessor import Preprocessor
+from gpu_scripts.market_labeler_ewma import MarketLabelerTBL, MarketFeatureGenerator
+from gpu_scripts.model import Model
+from gpu_scripts.train_one import _coerce_dates
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s - %(message)s",

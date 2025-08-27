@@ -6,8 +6,8 @@ run_ensemble.py - Train ensemble of models with different seeds and evaluate
 from pathlib import Path
 import torch, numpy as np, yaml, pandas as pd
 from datetime import datetime
-from train_one import SingleTrainer, save_model, _coerce_dates, predict_ensemble, load_ensemble
-from model import Model
+from gpu_scripts.train_one import SingleTrainer, save_model, _coerce_dates, predict_ensemble, load_ensemble
+from gpu_scripts.model import Model
 
 CFG       = "config.yaml"
 EA        = _coerce_dates(pd.read_csv("data/#1train.csv"))

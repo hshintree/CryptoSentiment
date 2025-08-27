@@ -29,8 +29,8 @@ from collections import defaultdict          # ← we already imported numpy onc
 from sklearn.metrics import confusion_matrix          # ➟ confusion-matrix
 from sklearn.metrics import f1_score          # ← NEW
 
-from model                 import Model
-from market_labeler_ewma   import MarketLabelerTBL, MarketFeatureGenerator
+from gpu_scripts.model                 import Model
+from gpu_scripts.market_labeler_ewma   import MarketLabelerTBL, MarketFeatureGenerator
 
 
 class Trainer:
@@ -209,7 +209,7 @@ class Trainer:
             
             # ✅ FOLD-WISE PREPROCESSING: Fit scaler on training data only
             print(f"  📊 Applying fold-wise preprocessing to prevent scaling leakage...")
-            from preprocessor import Preprocessor
+            from gpu_scripts.preprocessor import Preprocessor
             fold_preprocessor = Preprocessor(self.config_path)
             
             # Fit preprocessor on training data and transform both splits
@@ -794,8 +794,8 @@ class Trainer:
         averaged over *all* fold models.  
         If ``weighted=True`` each fold is weighted by its best val-F1.
         """
-        from preprocessor           import Preprocessor
-        from market_labeler_ewma    import MarketLabelerTBL, MarketFeatureGenerator
+        from gpu_scripts.preprocessor           import Preprocessor
+        from gpu_scripts.market_labeler_ewma    import MarketLabelerTBL, MarketFeatureGenerator
 
         device      = self.device
         n_models    = len(self.fold_states)

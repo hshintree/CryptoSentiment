@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import yaml
 from typing import Dict
-from model import Model  # Assuming Model class from model.py
+from gpu_scripts.model import Model  # Assuming Model class from model.py
 
 class SignalGenerator:
     """SignalGenerator class for converting model predictions into actionable trading signals."""

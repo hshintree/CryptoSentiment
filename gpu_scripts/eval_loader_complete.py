@@ -13,7 +13,7 @@ This is the final, production-ready version that implements all requirements:
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import TimeSeriesSplit
-from market_labeler_ewma import MarketLabelerTBL
+from gpu_scripts.market_labeler_ewma import MarketLabelerTBL
 from pathlib import Path
 
 

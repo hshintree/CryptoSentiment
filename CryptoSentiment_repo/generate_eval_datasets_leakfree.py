@@ -18,7 +18,7 @@ from datetime import datetime
 import pandas as pd, numpy as np
 from tqdm import tqdm
 
-from market_labeler_ewma import MarketLabelerTBL, MarketFeatureGenerator
+from gpu_scripts.market_labeler_ewma import MarketLabelerTBL, MarketFeatureGenerator
 
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)

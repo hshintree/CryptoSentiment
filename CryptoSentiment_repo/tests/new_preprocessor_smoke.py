@@ -1,5 +1,5 @@
 from dataset_loader import DatasetLoader
-from preprocessor import Preprocessor
+from gpu_scripts.preprocessor import Preprocessor
 
 dl   = DatasetLoader("config.yaml")
 pp   = Preprocessor("config.yaml")

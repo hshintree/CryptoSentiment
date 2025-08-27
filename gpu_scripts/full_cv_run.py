@@ -15,10 +15,10 @@ from pathlib import Path
 from datetime import datetime
 import torch
 
-from preprocessor import Preprocessor
-from market_labeler_ewma import MarketLabelerTBL
-from model import Model
-from trainer import Trainer
+from gpu_scripts.preprocessor import Preprocessor
+from gpu_scripts.market_labeler_ewma import MarketLabelerTBL
+from gpu_scripts.model import Model
+from gpu_scripts.trainer import Trainer
 from sklearn.metrics import (accuracy_score,
                              precision_recall_fscore_support)
 from glob import glob
