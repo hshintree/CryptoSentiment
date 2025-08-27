@@ -4,6 +4,7 @@ Script to fine-tune the Context-Aware (CA) CryptoBERT model
 on your EA dataset with 5-fold grouped CV, exactly as in the paper.
 """
 
+import argparse
 import os
 import yaml
 import pandas as pd
@@ -14,6 +15,11 @@ from market_labeler_ewma import MarketLabelerTBL         # your enhanced labeler
 from pathlib import Path
 from datetime import datetime
 import time, datetime
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--no-save", action="store_true", help="Do not write CSV artifacts (signals_per_tweet.csv, ea_daily_signals.csv)")
+ap.add_argument("--timestamped", action="store_true", help="Append timestamp to output filenames")
+args = ap.parse_args()
 
 # ── 1. Configuration ───────────────────────────────────────────
 CFG = "config.yaml"
@@ -30,7 +36,7 @@ pp = Preprocessor(CFG)
 ea_pp = pp.preprocess(ea)   # adds Tweet Content normalization, ROC, RSI, etc.
 
 # Market-derived labels + EWMA volatility features (needs 'date' column name)
-    ml = MarketLabelerTBL("config.yaml")
+ml = MarketLabelerTBL("config.yaml")
 ea_lbl = ml.label_data(ea_pp)  # adds 'Label' and 'Volatility' columns
 
 # NOW rename columns for compatibility with trainer
@@ -80,9 +86,10 @@ sig_df = cross_val_predict(trainer, ea_lbl, CFG)
 print("cross_val_predict:", time.time() - t3, "s")
 
 # 3) CSV writes
-t4 = time.time()
-sig_df.to_csv("signals_per_tweet.csv", index=False)
-print("to_csv:", time.time() - t4, "s")
+ts_suffix = "_" + datetime.now().strftime("%Y%m%d_%H%M%S") if args.timestamped else ""
+if not args.no_save:
+    sig_df.to_csv(f"signals_per_tweet{ts_suffix}.csv", index=False)
+    print("to_csv:", time.time() - t4, "s")
 
 # ── 5. (Optional) Daily aggregation ───────────────────────────
 # Majority-vote per date to get one signal/day
@@ -93,5 +100,6 @@ daily = (
     .agg(lambda x: x.value_counts().idxmax())
     .rename("Daily_Signal")
 )
-daily.to_csv("ea_daily_signals.csv")
-print("✓ Saved ea_daily_signals.csv")
+if not args.no_save:
+    daily.to_csv(f"ea_daily_signals{ts_suffix}.csv")
+    print("✓ Saved ea_daily_signals.csv")

@@ -29,6 +29,19 @@ from sklearn.metrics import (accuracy_score,
 from model   import Model
 from trainer import Trainer
 
+# --------------------------------------------------------------------- #
+# -------------------------- CLI ARGUMENTS ---------------------------- #
+# --------------------------------------------------------------------- #
+if len(sys.argv) < 2:
+    raise SystemExit("Usage:  checkpointed_inference.py <timestamp>  "
+                     "[sample_n=25000]  [csv_path]  [--no-save]  [--timestamped]")
+
+TS         = sys.argv[1]                 # e.g. 20250621_074712
+SAMPLE_N   = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 25_000
+CSV_PATH   = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else "data/#2val.csv"
+NO_SAVE    = "--no-save" in sys.argv
+TIMESTAMPED= "--timestamped" in sys.argv
+
 # ------------------------------------------------------------------ #
 # 1)  FIT PREPROCESSOR ON THE *TRAINING* SET ONLY                    #
 # ------------------------------------------------------------------ #
@@ -36,21 +49,6 @@ EA_CSV   = Path("data/#1train.csv")
 ea_train = (pd.read_csv(EA_CSV)
               .rename(columns={"date": "Tweet Date"}))
 ea_train["Tweet Date"] = pd.to_datetime(ea_train["Tweet Date"], errors="coerce")
-
-# --------------------------------------------------------------------- #
-# -------------------------- CLI ARGUMENTS ---------------------------- #
-# --------------------------------------------------------------------- #
-if len(sys.argv) < 2:
-    raise SystemExit("Usage:  checkpointed_inference.py <timestamp>  "
-                     "[sample_n=25000]  [csv_path]")
-
-TS         = sys.argv[1]                 # e.g. 20250621_074712
-SAMPLE_N   = int(sys.argv[2]) if len(sys.argv) > 2 else 25_000
-CSV_PATH   = sys.argv[3] if len(sys.argv) > 3 else "data/#2val.csv"
-
-CKPT_ROOT  = Path("models") / f"ea_"
-if not CKPT_ROOT.exists():
-    raise SystemExit(f"❌  {CKPT_ROOT} not found")
 
 # --------------------------------------------------------------------- #
 # ------------------------------ DATA --------------------------------- #
@@ -118,6 +116,11 @@ USE_FOLDS = set()                     # finds all available fold directories
 #   • fold2/                           (plain)
 #   • fold2_epoch3/                    (epoch-suffixed)
 # ------------------------------------------------------------------
+from glob import glob as _g
+CKPT_ROOT  = Path("models") / f"ea_"
+if not CKPT_ROOT.exists():
+    raise SystemExit(f"❌  {CKPT_ROOT} not found")
+
 def _resolve(fold_name: str) -> Path | None:
     """Return the directory that actually exists for this fold."""
     plain = CKPT_ROOT / fold_name
@@ -168,8 +171,11 @@ if not trainer.fold_states:
 print("\n🔹 Running softmax-averaged ensemble …")
 VAL = trainer.ensemble_predict(VAL, weighted=True)
 
-VAL.to_csv("signals_val_2021.csv", index=False)
-print("✅  signals_val_2021.csv written")
+suffix = "_" + TS if TIMESTAMPED else ""
+
+if not NO_SAVE:
+    VAL.to_csv(f"signals_val_2021{suffix}.csv", index=False)
+    print(f"✅  signals_val_2021{suffix}.csv written")
 
 # ---- safe daily aggregation ---------------------------------------- #
 def _majority_or_neutral(series):
@@ -181,8 +187,9 @@ daily = (VAL.groupby(VAL["Tweet Date"].dt.normalize()).Pred_Label
            .agg(_majority_or_neutral)
            .rename("Daily_Signal"))
 
-daily.to_csv("val_daily_signals.csv")
-print("✅  val_daily_signals.csv written")
+if not NO_SAVE:
+    daily.to_csv(f"val_daily_signals{suffix}.csv")
+    print(f"✅  val_daily_signals{suffix}.csv written")
 
 # metrics
 if "Label" in VAL.columns:
